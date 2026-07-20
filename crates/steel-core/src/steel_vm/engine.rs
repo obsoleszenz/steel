@@ -91,6 +91,11 @@ use steel_rc::QueueHandle;
 
 use crate::parser::ast::IteratorExtensions;
 
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::alloc::{Allocator, Global};
+#[cfg(feature = "nightly")]
+use std::alloc::{Allocator, Global};
+
 thread_local! {
     static KERNEL_BIN_FILE: Cell<Option<&'static [u8]>> = const { Cell::new(None) };
 }
@@ -1355,11 +1360,24 @@ impl Engine {
         function: &str,
         arguments: &mut [SteelVal],
     ) -> Result<SteelVal> {
+        self.call_function_by_name_with_args_from_mut_slice_in(function, arguments, Global)
+    }
+
+    pub fn call_function_by_name_with_args_from_mut_slice_in<A: Allocator + std::marker::Copy>(
+        &mut self,
+        function: &str,
+        arguments: &mut [SteelVal],
+        alloc: A,
+    ) -> Result<SteelVal> {
         let constant_map = self.virtual_machine.compiler.read().constant_map.clone();
 
         self.extract_value(function).and_then(|function| {
-            self.virtual_machine
-                .call_function_from_mut_slice(constant_map, function, arguments)
+            self.virtual_machine.call_function_from_mut_slice_in(
+                constant_map,
+                function,
+                arguments,
+                alloc,
+            )
         })
     }
 

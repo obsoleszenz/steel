@@ -85,3 +85,42 @@ pub(crate) use declare_const_mut_ref_functions;
 //         Rc::new(RefCell::new(self))
 //     }
 // }
+
+/// Minimal `collect_in` support for `allocator_api2::vec::Vec<T, A>`, mirroring
+/// `bumpalo::collections::{FromIteratorIn, CollectIn}`. Unlike bumpalo's `Vec<'bump, T>`,
+/// `allocator_api2::vec::Vec` has no inherent `from_iter_in` to delegate to, so this has
+/// to actually build the vec rather than forwarding to a same-named method.
+pub trait FromIteratorIn<T> {
+    type Alloc;
+
+    fn from_iter_in<I>(iter: I, alloc: Self::Alloc) -> Self
+    where
+        I: IntoIterator<Item = T>;
+}
+
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::alloc::{Allocator, Global};
+#[cfg(feature = "nightly")]
+use std::alloc::Allocator;
+
+impl<A: Allocator, T> FromIteratorIn<T> for allocator_api2::vec::Vec<T, A> {
+    type Alloc = A;
+
+    fn from_iter_in<I>(iter: I, alloc: A) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let mut vec = allocator_api2::vec::Vec::with_capacity_in(iter.size_hint().0, alloc);
+        vec.extend(iter);
+        vec
+    }
+}
+
+pub trait CollectIn: Iterator + Sized {
+    fn collect_in<C: FromIteratorIn<Self::Item>>(self, alloc: C::Alloc) -> C {
+        C::from_iter_in(self, alloc)
+    }
+}
+
+impl<I: Iterator> CollectIn for I {}

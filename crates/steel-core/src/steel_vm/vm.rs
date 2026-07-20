@@ -1,4 +1,5 @@
 use crate::compiler::compiler::Compiler;
+
 use crate::compiler::modules::fully_qualified_to_relative;
 use crate::compiler::passes::VisitorMutRefUnit;
 use crate::core::instructions::u24;
@@ -81,6 +82,13 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 use steel_parser::interner::InternedString;
 use threads::ThreadHandle;
+
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::alloc::{Allocator, Global};
+#[cfg(feature = "nightly")]
+use std::alloc::Allocator;
+
+use crate::core::utils::CollectIn;
 
 use crate::rvals::{into_serializable_value, IntoSteelVal};
 
@@ -1009,6 +1017,16 @@ impl SteelThread {
         function: SteelVal,
         args: &mut [SteelVal],
     ) -> Result<SteelVal> {
+        self.call_function_from_mut_slice_in(constant_map, function, args, Global)
+    }
+
+    pub(crate) fn call_function_from_mut_slice_in<A: Allocator + std::marker::Copy>(
+        &mut self,
+        constant_map: ConstantMap,
+        function: SteelVal,
+        args: &mut [SteelVal],
+        alloc: A,
+    ) -> Result<SteelVal> {
         match function {
             SteelVal::FuncV(func) => func(args).map_err(|x| x.set_span_if_none(Span::default())),
             SteelVal::BoxedFunction(func) => {
@@ -1026,9 +1044,14 @@ impl SteelThread {
             SteelVal::CustomStruct(ref s) => {
                 if let Some(procedure) = s.maybe_proc() {
                     if let SteelVal::HeapAllocated(h) = procedure {
-                        self.call_function_from_mut_slice(constant_map, h.get(), args)
+                        self.call_function_from_mut_slice_in(constant_map, h.get(), args, alloc)
                     } else {
-                        self.call_function_from_mut_slice(constant_map, procedure.clone(), args)
+                        self.call_function_from_mut_slice_in(
+                            constant_map,
+                            procedure.clone(),
+                            args,
+                            alloc,
+                        )
                     }
                 } else {
                     stop!(TypeMismatch => format!("application not a procedure: {function}"))
@@ -1036,19 +1059,22 @@ impl SteelThread {
             }
 
             SteelVal::Closure(closure) => {
-                // Create phony span vec
+                // Create phony span vec, sourced from the caller-supplied allocator rather
+                // than the global one, since it's pure per-call scratch: current_span_for_index
+                // already falls back to Span::default() via a checked `.get(ip)`, so this never
+                // needs to outlive the call.
                 let spans = closure
                     .body_exp()
                     .iter()
                     .map(|_| Span::default())
-                    .collect::<Vec<_>>();
+                    .collect_in::<allocator_api2::vec::Vec<_, A>>(alloc);
 
                 let mut vm_instance = VmCore::new_unchecked(
                     // Shared::new([]),
                     RootedInstructions::new(THE_EMPTY_INSTRUCTION_SET.with(|x| x.clone())),
                     constant_map,
                     self,
-                    &spans,
+                    spans.as_slice(),
                 );
 
                 vm_instance.call_with_args(&closure, args.iter().cloned())

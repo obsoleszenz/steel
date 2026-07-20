@@ -27,7 +27,8 @@ steel-core = { path = "./crates/steel-core", version = "0.8.2", features = [
     "rooted-instructions",
     "imbl",
     "jit2",
-    "biased"
+    "biased",
+    "allocator-api2"
 ] }
 
 [features]
@@ -37,6 +38,7 @@ mimalloc = ["dep:mimalloc"]
 snmalloc = ["dep:snmalloc-rs"]
 triomphe = ["steel-core/triomphe"]
 imbl = ["steel-core/imbl"]
+allocator-api2 = ["steel-core/allocator-api2"]
 
 # Note: It does not appear that this will get propagated to any crate that depends on
 # the workspace feature. This is unfortunate, since we'd like everything to actually
@@ -62,6 +64,9 @@ snmalloc-rs = { version = "0.3.8", optional = true, default-features = false, fe
     "native-cpu",
     "lto"
 ] }
+
+
+bumpalo = { git = "https://github.com/gagbo/bumpalo.git", branch= "bump_allocator_api2", features = ["allocator-api2"] }
 
 [target.'cfg(not(target_os = "redox"))'.dependencies]
 cargo-steel-lib = { path = "./crates/cargo-steel-lib", version = "0.8.2" }
