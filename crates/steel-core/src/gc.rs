@@ -27,6 +27,87 @@ use parking_lot::RwLock;
 ))]
 use allocator_api2::alloc::{Allocator, Global};
 
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub mod arena {
+    use super::{Allocator, Global};
+    use allocator_api2::alloc::AllocError;
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+
+    /// The allocator backing `SteelVal::Custom` values. Can be swapped, per engine, from the
+    /// ordinary global allocator to any caller-supplied `Allocator` (e.g. a bump arena backed by
+    /// `bumpalo`, or anything else implementing the trait) -- steel-core itself has no opinion
+    /// on, or dependency on, which concrete allocator that is; it only depends on the
+    /// `allocator-api2` trait. `ArenaAlloc::custom` type-erases whatever the caller passes in
+    /// behind `dyn Allocator + Send + Sync`.
+    ///
+    /// The `Send + Sync` bound is load-bearing: `SteelVal` must stay usable across threads for
+    /// every existing multi-threaded Steel program, so a custom allocator that isn't itself
+    /// thread-safe (e.g. a bare bump arena, which is usually built on `Cell`s) needs the caller
+    /// to wrap it in something that is (a `Mutex`, for instance) before handing it here -- that
+    /// wrapping is the caller's concern, not steel-core's.
+    ///
+    /// Note a bump-style allocator typically never reclaims individual `deallocate` calls the
+    /// way the global allocator does (that's the point -- no free-list bookkeeping on the hot
+    /// path); memory only grows until the underlying arena is dropped. That's an intentional
+    /// tradeoff for callers who opt in, not a leak: pick one only for a bounded-lifetime engine,
+    /// or one you're willing to have grow for its lifetime.
+    #[derive(Clone)]
+    pub enum ArenaAlloc {
+        Global,
+        Custom(Arc<dyn Allocator + Send + Sync>),
+    }
+
+    impl Default for ArenaAlloc {
+        fn default() -> Self {
+            ArenaAlloc::Global
+        }
+    }
+
+    impl ArenaAlloc {
+        pub fn custom(alloc: impl Allocator + Send + Sync + 'static) -> Self {
+            ArenaAlloc::Custom(Arc::new(alloc))
+        }
+    }
+
+    unsafe impl Allocator for ArenaAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            match self {
+                ArenaAlloc::Global => Global.allocate(layout),
+                ArenaAlloc::Custom(alloc) => alloc.allocate(layout),
+            }
+        }
+
+        fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            match self {
+                ArenaAlloc::Global => Global.allocate_zeroed(layout),
+                ArenaAlloc::Custom(alloc) => alloc.allocate_zeroed(layout),
+            }
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            match self {
+                ArenaAlloc::Global => unsafe { Global.deallocate(ptr, layout) },
+                ArenaAlloc::Custom(alloc) => unsafe { alloc.deallocate(ptr, layout) },
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub use arena::ArenaAlloc;
+
 pub mod shared {
     use alloc::rc::Rc;
     use core::cell::{BorrowError, BorrowMutError, Ref, RefCell, RefMut};
