@@ -429,6 +429,17 @@ pub struct SteelThread {
     pub(crate) jit: Arc<Mutex<crate::jit2::cgen::JIT>>,
 
     pub(crate) module_context: Vec<SteelString>,
+
+    // The allocator new `SteelVal::Custom` values get built with while this thread is running.
+    // Defaults to `ArenaAlloc::Global`, so a thread that never calls a configuration method sees
+    // zero change from before this field existed.
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub(crate) custom_arena: crate::gc::ArenaAlloc,
 }
 
 #[derive(Clone)]
@@ -807,6 +818,13 @@ impl SteelThread {
             jit: Arc::new(Mutex::new(crate::jit2::cgen::JIT::default())),
             module_context: Vec::new(),
             // delayed_dropper: DelayedDropper::new(),
+            #[cfg(all(
+                feature = "sync",
+                feature = "biased",
+                feature = "allocator-api2",
+                not(feature = "triomphe")
+            ))]
+            custom_arena: crate::gc::ArenaAlloc::Global,
         }
     }
 
