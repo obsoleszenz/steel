@@ -774,18 +774,45 @@ pub type CustomGc<T> = Gc<RwLock<T>, ArenaAlloc>;
 )))]
 pub type CustomGc<T> = GcMut<T>;
 
-/// Builds the `Gc` backing a fresh `SteelVal::Custom`, via the ambient arena on build combos
-/// that support one, or plain `Global` otherwise. Centralizing this (rather than calling
-/// `Gc::new_mut`/`new_mut_in` directly at each `SteelVal::Custom` construction site) means
-/// callers don't need their own cfg gate for which constructor exists on which combo.
+/// The `Box` shape holding the concrete `dyn CustomType` trait object inside `SteelVal::Custom`:
+/// allocator-aware (and thus arena-backed, alongside the `Gc` wrapping it) on the combo that
+/// supports one, plain `Box` elsewhere. Without this, a `Custom` value's outer `Gc`/`RcBox`
+/// would come from the ambient arena but the inner box holding the actual value would still
+/// silently go through the global allocator every time.
 #[cfg(all(
     feature = "sync",
     feature = "biased",
     feature = "allocator-api2",
     not(feature = "triomphe")
 ))]
-pub fn new_custom_gc<T>(val: T) -> CustomGc<T> {
-    Gc::new_mut_in(val, current_arena())
+pub type ArenaBox<T> = allocator_api2::boxed::Box<T, ArenaAlloc>;
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub type ArenaBox<T> = Box<T>;
+
+/// Builds the `Gc`+`Box` backing a fresh `SteelVal::Custom` from a concrete `CustomType` value,
+/// via the ambient arena on build combos that support one, or plain `Global` otherwise.
+/// Centralizing this (rather than boxing/wrapping directly at each `SteelVal::Custom`
+/// construction site) means callers don't need their own cfg gate for which constructor exists
+/// on which combo.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub fn new_custom_gc<T: crate::rvals::CustomType + 'static>(
+    val: T,
+) -> CustomGc<ArenaBox<dyn crate::rvals::CustomType>> {
+    let alloc = current_arena();
+    let boxed: ArenaBox<dyn crate::rvals::CustomType> =
+        allocator_api2::unsize_box!(allocator_api2::boxed::Box::new_in(val, alloc.clone()));
+    Gc::new_mut_in(boxed, alloc)
 }
 
 #[cfg(not(all(
@@ -794,8 +821,10 @@ pub fn new_custom_gc<T>(val: T) -> CustomGc<T> {
     feature = "allocator-api2",
     not(feature = "triomphe")
 )))]
-pub fn new_custom_gc<T>(val: T) -> CustomGc<T> {
-    Gc::new_mut(val)
+pub fn new_custom_gc<T: crate::rvals::CustomType + 'static>(
+    val: T,
+) -> CustomGc<ArenaBox<dyn crate::rvals::CustomType>> {
+    Gc::new_mut(Box::new(val))
 }
 
 #[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]

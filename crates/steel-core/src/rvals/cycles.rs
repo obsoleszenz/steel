@@ -599,7 +599,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for CycleCollector<'a> {
 
     // If we have cycles here, it is game over - we probably don't want to be
     // able to render to these easily?
-    fn visit_custom_type(&mut self, _custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output {}
+    fn visit_custom_type(&mut self, _custom_type: CustomGc<ArenaBox<dyn CustomType>>) -> Self::Output {}
 
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
         if !self.add(
@@ -929,7 +929,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for IterativeDropHandler<'a> {
         }
     }
 
-    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) {
+    fn visit_custom_type(&mut self, custom_type: CustomGc<ArenaBox<dyn CustomType>>) {
         if let Ok(inner) = custom_type.try_unwrap() {
             let mut inner = inner.consume();
 
@@ -1284,7 +1284,7 @@ impl BreadthFirstSearchSteelValVisitor for OwnedIterativeDropHandler {
         }
     }
 
-    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) {
+    fn visit_custom_type(&mut self, custom_type: CustomGc<ArenaBox<dyn CustomType>>) {
         if let Ok(inner) = custom_type.try_unwrap() {
             let mut inner = inner.consume();
 
@@ -1587,7 +1587,7 @@ pub trait BreadthFirstSearchSteelValVisitor {
     fn visit_string(&mut self, string: SteelString) -> Self::Output;
     fn visit_function_pointer(&mut self, ptr: FunctionSignature) -> Self::Output;
     fn visit_symbol(&mut self, symbol: SteelString) -> Self::Output;
-    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output;
+    fn visit_custom_type(&mut self, custom_type: CustomGc<ArenaBox<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: SteelHashSet) -> Self::Output;
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output;
@@ -1683,7 +1683,7 @@ pub trait BreadthFirstSearchSteelValVisitor2 {
     fn visit_string(&mut self, string: SteelString) -> Self::Output;
     fn visit_function_pointer(&mut self, ptr: FunctionSignature) -> Self::Output;
     fn visit_symbol(&mut self, symbol: SteelString) -> Self::Output;
-    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output;
+    fn visit_custom_type(&mut self, custom_type: CustomGc<ArenaBox<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: SteelHashSet) -> Self::Output;
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output;
@@ -1780,7 +1780,7 @@ pub trait BreadthFirstSearchSteelValReferenceVisitor<'a> {
     fn visit_string(&mut self, string: &'a SteelString) -> Self::Output;
     fn visit_function_pointer(&mut self, ptr: FunctionSignature) -> Self::Output;
     fn visit_symbol(&mut self, symbol: &'a SteelString) -> Self::Output;
-    fn visit_custom_type(&mut self, custom_type: &'a CustomGc<Box<dyn CustomType>>) -> Self::Output;
+    fn visit_custom_type(&mut self, custom_type: &'a CustomGc<ArenaBox<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: &'a SteelHashMap) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: &'a SteelHashSet) -> Self::Output;
     fn visit_steel_struct(&mut self, steel_struct: &'a Gc<UserDefinedStruct>) -> Self::Output;
@@ -1849,7 +1849,7 @@ pub(crate) trait BreadthFirstSearchSteelValReferenceVisitor2<'a> {
 
     fn visit_closure(&mut self, _: &'a ByteCodeLambda) -> Self::Output;
     fn visit_immutable_vector(&mut self, vector: &'a Vector<SteelVal>) -> Self::Output;
-    fn visit_custom_type(&mut self, custom_type: &'a RwLock<Box<dyn CustomType>>) -> Self::Output;
+    fn visit_custom_type(&mut self, custom_type: &'a RwLock<ArenaBox<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: &'a crate::HashMap<SteelVal, SteelVal>) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: &'a crate::HashSet<SteelVal>) -> Self::Output;
     fn visit_steel_struct(&mut self, steel_struct: &'a UserDefinedStruct) -> Self::Output;
@@ -2461,7 +2461,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for EqualityVisitor<'a> {
     }
 
     // SHOULD SET MUTABLE HERE
-    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output {
+    fn visit_custom_type(&mut self, custom_type: CustomGc<ArenaBox<dyn CustomType>>) -> Self::Output {
         custom_type.read().visit_children_for_equality(self);
     }
 
