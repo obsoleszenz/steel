@@ -8,7 +8,7 @@ use crate::{
             ScopedWriteContainer, ShareableMut, StandardShared,
         },
         unsafe_erased_pointers::{OpaqueReference, TemporaryMutableView, TemporaryReadonlyView},
-        Gc, GcMut,
+        ArenaBox, CustomGc, Gc, GcMut,
     },
     parser::{
         ast::{self, Atom, ExprKind},
@@ -409,7 +409,7 @@ impl<T: Custom + MaybeSendSyncStatic> CustomType for T {
 
 impl<T: CustomType + 'static> IntoSteelVal for T {
     fn into_steelval(self) -> Result<SteelVal> {
-        Ok(SteelVal::Custom(Gc::new_mut(Box::new(self))))
+        Ok(SteelVal::Custom(crate::gc::new_custom_gc(self)))
     }
 
     fn as_error(self) -> core::result::Result<SteelErr, Self> {
@@ -1658,7 +1658,7 @@ pub enum SteelVal {
     /// Represents a symbol, internally represented as `String`s
     SymbolV(SteelString),
     /// Container for a type that implements the `Custom Type` trait. (trait object)
-    Custom(GcMut<Box<dyn CustomType>>), // TODO: @Matt - consider using just a mutex here, to relax some of the bounds?
+    Custom(CustomGc<ArenaBox<dyn CustomType>>), // TODO: @Matt - consider using just a mutex here, to relax some of the bounds?
     // Embedded HashMap
     HashMapV(SteelHashMap),
     // Embedded HashSet
@@ -1776,7 +1776,7 @@ pub(crate) enum SteelValPointer {
     /// Represents a bytecode closure.
     Closure(*const ByteCodeLambda),
     VectorV(*const Vector<SteelVal>),
-    Custom(*const RwLock<Box<dyn CustomType>>),
+    Custom(*const RwLock<ArenaBox<dyn CustomType>>),
     HashMapV(*const HashMap<SteelVal, SteelVal>),
     HashSetV(*const HashSet<SteelVal>),
     CustomStruct(*const UserDefinedStruct),

@@ -19,6 +19,129 @@ pub use unsafe_erased_pointers::is_reference_type;
 #[cfg(feature = "sync")]
 use parking_lot::RwLock;
 
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+use allocator_api2::alloc::{Allocator, Global};
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub mod arena {
+    use super::{Allocator, Global};
+    use allocator_api2::alloc::AllocError;
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+
+    /// The allocator backing `SteelVal::Custom` values. Can be swapped, per engine, from the
+    /// ordinary global allocator to any caller-supplied `Allocator` (e.g. a bump arena backed by
+    /// `bumpalo`, or anything else implementing the trait) -- steel-core itself has no opinion
+    /// on, or dependency on, which concrete allocator that is; it only depends on the
+    /// `allocator-api2` trait. `ArenaAlloc::custom` type-erases whatever the caller passes in
+    /// behind `dyn Allocator + Send + Sync`.
+    ///
+    /// The `Send + Sync` bound is load-bearing: `SteelVal` must stay usable across threads for
+    /// every existing multi-threaded Steel program, so a custom allocator that isn't itself
+    /// thread-safe (e.g. a bare bump arena, which is usually built on `Cell`s) needs the caller
+    /// to wrap it in something that is (a `Mutex`, for instance) before handing it here -- that
+    /// wrapping is the caller's concern, not steel-core's.
+    ///
+    /// Note a bump-style allocator typically never reclaims individual `deallocate` calls the
+    /// way the global allocator does (that's the point -- no free-list bookkeeping on the hot
+    /// path); memory only grows until the underlying arena is dropped. That's an intentional
+    /// tradeoff for callers who opt in, not a leak: pick one only for a bounded-lifetime engine,
+    /// or one you're willing to have grow for its lifetime.
+    #[derive(Clone)]
+    pub enum ArenaAlloc {
+        Global,
+        Custom(Arc<dyn Allocator + Send + Sync>),
+    }
+
+    impl Default for ArenaAlloc {
+        fn default() -> Self {
+            ArenaAlloc::Global
+        }
+    }
+
+    impl ArenaAlloc {
+        pub fn custom(alloc: impl Allocator + Send + Sync + 'static) -> Self {
+            ArenaAlloc::Custom(Arc::new(alloc))
+        }
+    }
+
+    unsafe impl Allocator for ArenaAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            match self {
+                ArenaAlloc::Global => Global.allocate(layout),
+                ArenaAlloc::Custom(alloc) => alloc.allocate(layout),
+            }
+        }
+
+        fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            match self {
+                ArenaAlloc::Global => Global.allocate_zeroed(layout),
+                ArenaAlloc::Custom(alloc) => alloc.allocate_zeroed(layout),
+            }
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            match self {
+                ArenaAlloc::Global => unsafe { Global.deallocate(ptr, layout) },
+                ArenaAlloc::Custom(alloc) => unsafe { alloc.deallocate(ptr, layout) },
+            }
+        }
+    }
+
+    thread_local! {
+        // Which ArenaAlloc new Custom values should be built with on this thread right now.
+        // Defaults to Global, so engines that never call `set_current_arena` see zero change
+        // from today. Set for the duration of VM execution on a thread that's been configured
+        // with a non-default arena; read by the `IntoSteelVal` blanket impl for `CustomType`.
+        static CURRENT_ARENA: std::cell::RefCell<ArenaAlloc> =
+            std::cell::RefCell::new(ArenaAlloc::Global);
+    }
+
+    /// The `ArenaAlloc` new `Custom` values should be built with on this thread right now.
+    pub fn current_arena() -> ArenaAlloc {
+        CURRENT_ARENA.with(|a| a.borrow().clone())
+    }
+
+    /// Restores the previous ambient arena on drop, so nested calls (e.g. an engine calling
+    /// back into itself, or into a different engine) unwind correctly, including across a panic.
+    #[must_use = "the ambient arena reverts as soon as this guard drops"]
+    pub struct ArenaGuard {
+        previous: ArenaAlloc,
+    }
+
+    impl Drop for ArenaGuard {
+        fn drop(&mut self) {
+            let previous = std::mem::replace(&mut self.previous, ArenaAlloc::Global);
+            CURRENT_ARENA.with(|a| *a.borrow_mut() = previous);
+        }
+    }
+
+    /// Sets the ambient arena for new `Custom` values until the returned guard drops.
+    pub fn set_current_arena(new: ArenaAlloc) -> ArenaGuard {
+        let previous = CURRENT_ARENA.with(|a| a.replace(new));
+        ArenaGuard { previous }
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub use arena::{current_arena, set_current_arena, ArenaAlloc, ArenaGuard};
+
 pub mod shared {
     use alloc::rc::Rc;
     use core::cell::{BorrowError, BorrowMutError, Ref, RefCell, RefMut};
@@ -39,6 +162,14 @@ pub mod shared {
     use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 
     use super::Gc;
+
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    use super::Allocator;
 
     #[cfg(not(feature = "sync"))]
     pub type Shared<T> = Rc<T>;
@@ -80,9 +211,34 @@ pub mod shared {
     #[cfg(all(feature = "sync", feature = "triomphe", not(feature = "biased")))]
     pub type SharedMut<T> = triomphe::Arc<RwLock<T>>;
 
-    #[cfg(all(feature = "sync", feature = "biased", not(feature = "triomphe")))]
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub type Shared<T, A = allocator_api2::alloc::Global> = steel_rc::BiasedRc<T, A>;
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub type SharedMut<T, A = allocator_api2::alloc::Global> = steel_rc::BiasedRc<RwLock<T>, A>;
+
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        not(feature = "allocator-api2"),
+        not(feature = "triomphe")
+    ))]
     pub type Shared<T> = steel_rc::BiasedRc<T>;
-    #[cfg(all(feature = "sync", feature = "biased", not(feature = "triomphe")))]
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        not(feature = "allocator-api2"),
+        not(feature = "triomphe")
+    ))]
     pub type SharedMut<T> = steel_rc::BiasedRc<RwLock<T>>;
 
     #[cfg(feature = "sync")]
@@ -283,6 +439,59 @@ pub mod shared {
         }
     }
 
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    impl<T, A: Allocator + Clone + 'static> ShareableMut<T> for Gc<RwLock<T>, A> {
+        type ShareableRead<'a>
+            = RwLockReadGuard<'a, T>
+        where
+            T: 'a;
+        type ShareableWrite<'a>
+            = RwLockWriteGuard<'a, T>
+        where
+            T: 'a;
+        type TryReadResult<'a>
+            = Result<RwLockReadGuard<'a, T>, ()>
+        where
+            T: 'a;
+        type TryWriteResult<'a>
+            = Result<RwLockWriteGuard<'a, T>, ()>
+        where
+            T: 'a;
+
+        fn read<'a>(&'a self) -> Self::ShareableRead<'a> {
+            Gc::deref(self).read()
+        }
+
+        fn write<'a>(&'a self) -> Self::ShareableWrite<'a> {
+            Gc::deref(self).write()
+        }
+
+        fn try_read<'a>(&'a self) -> Self::TryReadResult<'a> {
+            match Gc::deref(self).try_read() {
+                Some(v) => Ok(v),
+                None => Err(()),
+            }
+        }
+
+        fn try_write<'a>(&'a self) -> Self::TryWriteResult<'a> {
+            match Gc::deref(self).try_write() {
+                Some(v) => Ok(v),
+                None => Err(()),
+            }
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    )))]
     impl<T> ShareableMut<T> for Gc<RwLock<T>> {
         type ShareableRead<'a>
             = RwLockReadGuard<'a, T>
@@ -450,10 +659,182 @@ pub mod shared {
 /// When enabled, this allows for complete sandboxing of data types
 /// It does not expose the full functionality of the `Rc` type
 /// but it does allow for some
-#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 // pub struct Gc<T: ?Sized>(pub(crate) Shared<T>);
+//
+// Note: PartialEq/Eq/Hash/PartialOrd/Ord/Debug are implemented manually below rather than via
+// `#[derive(...)]` -- a derive would add `A: PartialEq` etc. bounds (derive can't know the
+// allocator handle doesn't participate in equality/ordering/hashing), which would make
+// `Gc<T, Global>` (the overwhelmingly common case) fail to compile since `Global` implements
+// none of them.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub struct Gc<T: ?Sized + 'static, A: Allocator + Clone + 'static = Global>(
+    pub(crate) Shared<T, A>,
+);
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + PartialEq, A: Allocator + Clone + 'static> PartialEq for Gc<T, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + Eq, A: Allocator + Clone + 'static> Eq for Gc<T, A> {}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + std::hash::Hash, A: Allocator + Clone + 'static> std::hash::Hash for Gc<T, A> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + PartialOrd, A: Allocator + Clone + 'static> PartialOrd for Gc<T, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + Ord, A: Allocator + Clone + 'static> Ord for Gc<T, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + fmt::Debug, A: Allocator + Clone + 'static> fmt::Debug for Gc<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Gc<T: ?Sized + 'static>(pub(crate) Shared<T>);
 
+/// The `Gc`-wrapped-mutable-`T` shape backing `SteelVal::Custom` specifically: on the build
+/// combo where `Gc` is allocator-generic, this is `Gc<RwLock<T>, ArenaAlloc>` (so plain
+/// `CustomGc<T>` resolves to a swappable-per-engine allocator) rather than always-`Global`;
+/// elsewhere it's exactly `GcMut<T>` (which already picks `RwLock` vs `RefCell` based on the
+/// `sync` feature).
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub type CustomGc<T> = Gc<RwLock<T>, ArenaAlloc>;
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub type CustomGc<T> = GcMut<T>;
+
+/// The `Box` shape holding the concrete `dyn CustomType` trait object inside `SteelVal::Custom`:
+/// allocator-aware (and thus arena-backed, alongside the `Gc` wrapping it) on the combo that
+/// supports one, plain `Box` elsewhere. Without this, a `Custom` value's outer `Gc`/`RcBox`
+/// would come from the ambient arena but the inner box holding the actual value would still
+/// silently go through the global allocator every time.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub type ArenaBox<T> = allocator_api2::boxed::Box<T, ArenaAlloc>;
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub type ArenaBox<T> = Box<T>;
+
+/// Builds the `Gc`+`Box` backing a fresh `SteelVal::Custom` from a concrete `CustomType` value,
+/// via the ambient arena on build combos that support one, or plain `Global` otherwise.
+/// Centralizing this (rather than boxing/wrapping directly at each `SteelVal::Custom`
+/// construction site) means callers don't need their own cfg gate for which constructor exists
+/// on which combo.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub fn new_custom_gc<T: crate::rvals::CustomType + 'static>(
+    val: T,
+) -> CustomGc<ArenaBox<dyn crate::rvals::CustomType>> {
+    let alloc = current_arena();
+    let boxed: ArenaBox<dyn crate::rvals::CustomType> =
+        allocator_api2::unsize_box!(allocator_api2::boxed::Box::new_in(val, alloc.clone()));
+    Gc::new_mut_in(boxed, alloc)
+}
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub fn new_custom_gc<T: crate::rvals::CustomType + 'static>(
+    val: T,
+) -> CustomGc<ArenaBox<dyn crate::rvals::CustomType>> {
+    Gc::new_mut(Box::new(val))
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Pointer for Gc<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:p}", self.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Pointer for Gc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:p}", self.0)
@@ -476,6 +857,19 @@ pub fn get_object_count() -> usize {
     OBJECT_COUNT.fetch_add(0, Ordering::SeqCst)
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: Clone, A: Allocator + Clone + 'static> Gc<T, A> {
+    /// Deep clone the object to remove it from the GC
+    pub fn unwrap(&self) -> T {
+        (*self.0).clone()
+    }
+
+    pub fn make_mut(&mut self) -> &mut T {
+        Shared::make_mut(&mut self.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: Clone> Gc<T> {
     /// Deep clone the object to remove it from the GC
     pub fn unwrap(&self) -> T {
@@ -487,6 +881,65 @@ impl<T: Clone> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T> Gc<T> {
+    pub fn new(val: T) -> Gc<T> {
+        Gc(Shared::new(val))
+    }
+
+    pub fn new_mut(val: T) -> GcMut<T> {
+        Gc::new(RwLock::new(val))
+    }
+
+    pub fn new_lock(val: T) -> GcLock<T> {
+        Gc::new(parking_lot::Mutex::new(val))
+    }
+
+    pub fn try_new(val: T) -> Result<Gc<T>, SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
+        if mem > MAXIMUM_OBJECTS {
+            stop!(Generic => "ran out of memory!")
+        }
+        Ok(Gc(Shared::new(val)))
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T, A: Allocator + Clone + 'static> Gc<T, A> {
+    pub fn new_in(val: T, alloc: A) -> Self {
+        Gc(Shared::new_in(val, alloc))
+    }
+
+    pub fn new_mut_in(val: T, alloc: A) -> Gc<RwLock<T>, A> {
+        Gc::new_in(RwLock::new(val), alloc)
+    }
+
+    pub fn new_lock_in(val: T, alloc: A) -> Gc<parking_lot::Mutex<T>, A> {
+        Gc::new_in(parking_lot::Mutex::new(val), alloc)
+    }
+
+    pub fn checked_allocate(allocations: usize) -> Result<(), SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(0, Ordering::SeqCst);
+        if mem + allocations > MAXIMUM_OBJECTS {
+            stop!(Generic => "allocation would exceed maximum allowed memory")
+        }
+        Ok(())
+    }
+
+    pub fn try_unwrap(self) -> Result<T, Gc<T, A>> {
+        Shared::try_unwrap(self.0).map_err(|x| Gc(x))
+    }
+
+    pub fn check_memory() -> Result<usize, SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(0, Ordering::SeqCst);
+        if mem > MAXIMUM_OBJECTS {
+            stop!(Generic => "ran out of memory!")
+        }
+        Ok(mem)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T> Gc<T> {
     pub fn new(val: T) -> Gc<T> {
         // OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -542,6 +995,34 @@ impl<T> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Gc<T, A> {
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        Shared::get_mut(&mut self.0)
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        Shared::ptr_eq(&this.0, &other.0)
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        Shared::as_ptr(&self.0)
+    }
+
+    pub fn into_raw(self) -> *const T {
+        Shared::into_raw(self.0)
+    }
+
+    pub unsafe fn from_raw(this: *const T) -> Self {
+        Self(unsafe { Shared::from_raw(this) })
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        Shared::strong_count(&this.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Gc<T> {
     pub fn get_mut(&mut self) -> Option<&mut T> {
         Shared::get_mut(&mut self.0)
@@ -568,12 +1049,29 @@ impl<T: ?Sized> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T, A: Allocator + Clone + 'static> AsRef<T> for Gc<T, A> {
+    fn as_ref(&self) -> &T {
+        self.0.as_ref()
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T> AsRef<T> for Gc<T> {
     fn as_ref(&self) -> &T {
         self.0.as_ref()
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Deref for Gc<T, A> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.deref()
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Deref for Gc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -581,6 +1079,15 @@ impl<T: ?Sized> Deref for Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Clone for Gc<T, A> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Gc(Shared::clone(&self.0))
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Clone for Gc<T> {
     #[inline(always)]
     fn clone(&self) -> Self {

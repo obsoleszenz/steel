@@ -1,4 +1,5 @@
 use crate::compiler::compiler::Compiler;
+
 use crate::compiler::modules::fully_qualified_to_relative;
 use crate::compiler::passes::VisitorMutRefUnit;
 use crate::core::instructions::u24;
@@ -81,6 +82,8 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 use steel_parser::interner::InternedString;
 use threads::ThreadHandle;
+
+use crate::core::utils::CollectIn;
 
 use crate::rvals::{into_serializable_value, IntoSteelVal};
 
@@ -421,6 +424,17 @@ pub struct SteelThread {
     pub(crate) jit: Arc<Mutex<crate::jit2::cgen::JIT>>,
 
     pub(crate) module_context: Vec<SteelString>,
+
+    // The allocator new `SteelVal::Custom` values get built with while this thread is running.
+    // Defaults to `ArenaAlloc::Global`, so a thread that never calls a configuration method sees
+    // zero change from before this field existed.
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub(crate) custom_arena: crate::gc::ArenaAlloc,
 }
 
 #[derive(Clone)]
@@ -799,6 +813,13 @@ impl SteelThread {
             jit: Arc::new(Mutex::new(crate::jit2::cgen::JIT::default())),
             module_context: Vec::new(),
             // delayed_dropper: DelayedDropper::new(),
+            #[cfg(all(
+                feature = "sync",
+                feature = "biased",
+                feature = "allocator-api2",
+                not(feature = "triomphe")
+            ))]
+            custom_arena: crate::gc::ArenaAlloc::Global,
         }
     }
 
@@ -1036,7 +1057,31 @@ impl SteelThread {
             }
 
             SteelVal::Closure(closure) => {
-                // Create phony span vec
+                // Create phony span vec, sourced from this engine's configured Custom-value
+                // arena (Global by default) rather than always the system allocator directly --
+                // it's pure per-call scratch: current_span_for_index already falls back to
+                // Span::default() via a checked `.get(ip)`, so this never needs to outlive the
+                // call, same as any other transient allocation made during it.
+                #[cfg(all(
+                    feature = "sync",
+                    feature = "biased",
+                    feature = "allocator-api2",
+                    not(feature = "triomphe")
+                ))]
+                let spans = closure
+                    .body_exp()
+                    .iter()
+                    .map(|_| Span::default())
+                    .collect_in::<allocator_api2::vec::Vec<_, crate::gc::ArenaAlloc>>(
+                        self.custom_arena.clone(),
+                    );
+
+                #[cfg(not(all(
+                    feature = "sync",
+                    feature = "biased",
+                    feature = "allocator-api2",
+                    not(feature = "triomphe")
+                )))]
                 let spans = closure
                     .body_exp()
                     .iter()
@@ -1048,7 +1093,7 @@ impl SteelThread {
                     RootedInstructions::new(THE_EMPTY_INSTRUCTION_SET.with(|x| x.clone())),
                     constant_map,
                     self,
-                    &spans,
+                    spans.as_slice(),
                 );
 
                 vm_instance.call_with_args(&closure, args.iter().cloned())

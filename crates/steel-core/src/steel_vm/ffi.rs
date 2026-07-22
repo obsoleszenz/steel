@@ -10,7 +10,7 @@ use std::{
 use crate::{
     gc::{
         shared::{ScopedWriteContainer, ShareableMut},
-        Gc,
+        ArenaBox, Gc,
     },
     rerrs::ErrorKind,
     rvals::{
@@ -1115,7 +1115,7 @@ pub struct CustomRef<'a> {
     pub custom: RMut<'a, OpaqueObject_TO<'static, RBox<()>>>,
     // TODO: Make this private
     #[sabi(unsafe_opaque_field)]
-    guard: ScopedWriteContainer<'a, Box<dyn CustomType>>,
+    guard: ScopedWriteContainer<'a, ArenaBox<dyn CustomType>>,
 }
 
 #[repr(C)]
@@ -1123,7 +1123,7 @@ pub struct CustomRef<'a> {
 pub struct VectorRef<'a> {
     pub vec: RSliceMut<'a, FFIValue>,
     #[sabi(unsafe_opaque_field)]
-    guard: ScopedWriteContainer<'a, Box<dyn CustomType>>,
+    guard: ScopedWriteContainer<'a, ArenaBox<dyn CustomType>>,
 }
 
 #[repr(C)]
@@ -1131,7 +1131,7 @@ pub struct VectorRef<'a> {
 pub struct StringMutRef<'a> {
     string: RMut<'a, RString>,
     #[sabi(unsafe_opaque_field)]
-    guard: ScopedWriteContainer<'a, Box<dyn CustomType>>,
+    guard: ScopedWriteContainer<'a, ArenaBox<dyn CustomType>>,
 }
 
 #[repr(C)]
@@ -1139,7 +1139,7 @@ pub struct StringMutRef<'a> {
 pub struct ByteVectorRef<'a> {
     buffer: RMut<'a, RVec<u8>>,
     #[sabi(unsafe_opaque_field)]
-    guard: ScopedWriteContainer<'a, Box<dyn CustomType>>,
+    guard: ScopedWriteContainer<'a, ArenaBox<dyn CustomType>>,
 }
 
 // TODO:
@@ -1528,7 +1528,7 @@ impl IntoSteelVal for FFIValue {
             Self::BoxedFunction(b) => {
                 Ok(SteelVal::BoxedFunction(Gc::new(RBox::into_inner(b).into())))
             }
-            Self::Custom { custom } => Ok(SteelVal::Custom(Gc::new_mut(Box::new(custom)))),
+            Self::Custom { custom } => Ok(SteelVal::Custom(crate::gc::new_custom_gc(custom))),
             Self::BoolV(b) => Ok(SteelVal::BoolV(b)),
             Self::NumV(n) => Ok(SteelVal::NumV(n)),
             Self::IntV(i) => Ok(SteelVal::IntV(i)),

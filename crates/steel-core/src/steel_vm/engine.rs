@@ -1350,11 +1350,34 @@ impl Engine {
         })
     }
 
+    /// Sets the allocator new `SteelVal::Custom` values are built with while this engine runs,
+    /// e.g. a bump arena instead of the global allocator. Defaults to `ArenaAlloc::Global`
+    /// (the ordinary global allocator), so engines that never call this see no change.
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub fn set_custom_value_arena(&mut self, arena: crate::gc::ArenaAlloc) {
+        self.virtual_machine.custom_arena = arena;
+    }
+
     pub fn call_function_by_name_with_args_from_mut_slice(
         &mut self,
         function: &str,
         arguments: &mut [SteelVal],
     ) -> Result<SteelVal> {
+        // Both Custom-value construction and the VM's own transient scratch allocations made
+        // during this call go through this engine's configured arena (Global by default).
+        #[cfg(all(
+            feature = "sync",
+            feature = "biased",
+            feature = "allocator-api2",
+            not(feature = "triomphe")
+        ))]
+        let _arena_guard = crate::gc::set_current_arena(self.virtual_machine.custom_arena.clone());
+
         let constant_map = self.virtual_machine.compiler.read().constant_map.clone();
 
         self.extract_value(function).and_then(|function| {
