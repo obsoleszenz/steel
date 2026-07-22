@@ -17,7 +17,7 @@ use crate::{
     compiler::map::SymbolMap,
     gc::{
         shared::{MutContainer, ShareableMut, StandardShared, StandardSharedMut, WeakShared},
-        GcMut,
+        CustomGc, GcMut,
     },
     rvals::{
         AsRefSteelVal, Custom, IntoSteelVal, OpaqueIterator, RestArgsIter, SteelComplex,
@@ -320,7 +320,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         }
     }
     // TODO: Come back to this
-    fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
+    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
@@ -2579,7 +2579,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
         }
     }
     // TODO: Come back to this
-    fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
+    fn visit_custom_type(&mut self, custom_type: CustomGc<Box<dyn CustomType>>) -> Self::Output {
         custom_type.read().visit_children(self);
     }
 

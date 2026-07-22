@@ -1528,7 +1528,9 @@ impl IntoSteelVal for FFIValue {
             Self::BoxedFunction(b) => {
                 Ok(SteelVal::BoxedFunction(Gc::new(RBox::into_inner(b).into())))
             }
-            Self::Custom { custom } => Ok(SteelVal::Custom(Gc::new_mut(Box::new(custom)))),
+            Self::Custom { custom } => {
+                Ok(SteelVal::Custom(crate::gc::new_custom_gc(Box::new(custom))))
+            }
             Self::BoolV(b) => Ok(SteelVal::BoolV(b)),
             Self::NumV(n) => Ok(SteelVal::NumV(n)),
             Self::IntV(i) => Ok(SteelVal::IntV(i)),
