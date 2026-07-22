@@ -278,9 +278,16 @@ impl SharedPacked {
     }
 }
 
+// `alloc` lives in the heap-allocated block (not in `BiasedRc` itself) so that `BiasedRc<T, A>`
+// stays exactly pointer-sized (`NonNull<RcBox<T, A>>`) no matter how large `A` is -- a pointer's
+// size never depends on what it points to. This matters because `BiasedRc` backs
+// `SteelVal::Custom`, and `SteelVal` has a hard `size_of::<SteelVal>() <= 16` budget; storing a
+// real (non-ZST) allocator handle directly in the `BiasedRc` handle would blow that for every
+// `SteelVal` variant, not just `Custom`.
 #[repr(C)]
-pub struct RcBox<T: ?Sized> {
+pub struct RcBox<T: ?Sized, A> {
     rcword: RcWord,
+    alloc: A,
     data: T,
 }
 
@@ -305,7 +312,7 @@ pub enum DecrementAction {
     Deallocate,
 }
 
-impl<T: ?Sized> RcBox<T> {
+impl<T: ?Sized, A> RcBox<T, A> {
     // TODO: Lift this to the Obj struct that eventually gets made
     pub fn increment(&self) {
         // let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
@@ -676,20 +683,17 @@ impl QueueHandle {
         if let Some(mut q) = QUEUE.map.get_mut(&key) {
             q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
                 value.ptr,
-                value.alloc.clone(),
             )))));
         } else {
             if let Some(mut q) = QUEUE.unregistered.get_mut(&key) {
                 q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
                     value.ptr,
-                    value.alloc.clone(),
                 )))));
             } else {
                 QUEUE.unregistered.insert(
                     key,
                     vec![Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
                         value.ptr,
-                        value.alloc.clone(),
                     ))))],
                 );
             }
@@ -795,10 +799,9 @@ impl<A: Allocator + Clone + 'static> BiasedRc<dyn Any, A> {
     #[inline]
     pub fn downcast<T: Any>(self) -> Result<BiasedRc<T, A>, Self> {
         if (*self).is::<T>() {
-            let ptr = self.ptr.cast::<RcBox<T>>();
-            let alloc = unsafe { ptr::read(&self.alloc) };
+            let ptr = self.ptr.cast::<RcBox<T, A>>();
             mem::forget(self);
-            Ok(BiasedRc::from_inner(ptr, alloc))
+            Ok(BiasedRc::from_inner(ptr))
         } else {
             Err(self)
         }
@@ -809,10 +812,9 @@ impl<A: Allocator + Clone + 'static> BiasedRc<dyn Any + Sync + Send, A> {
     #[inline]
     pub fn downcast<T: Any + Sync + Send>(self) -> Result<BiasedRc<T, A>, Self> {
         if (*self).is::<T>() {
-            let ptr = self.ptr.cast::<RcBox<T>>();
-            let alloc = unsafe { ptr::read(&self.alloc) };
+            let ptr = self.ptr.cast::<RcBox<T, A>>();
             mem::forget(self);
-            Ok(BiasedRc::from_inner(ptr, alloc))
+            Ok(BiasedRc::from_inner(ptr))
         } else {
             Err(self)
         }
@@ -824,10 +826,9 @@ impl<T: Any + 'static, A: Allocator + Clone + 'static> From<BiasedRc<T, A>>
 {
     #[inline]
     fn from(src: BiasedRc<T, A>) -> Self {
-        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any>;
-        let alloc = unsafe { ptr::read(&src.alloc) };
+        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any, A>;
         mem::forget(src);
-        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) }, alloc)
+        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
     }
 }
 
@@ -836,14 +837,13 @@ impl<T: Any + Sync + Send + 'static, A: Allocator + Clone + 'static> From<Biased
 {
     #[inline]
     fn from(src: BiasedRc<T, A>) -> Self {
-        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any + Sync + Send>;
-        let alloc = unsafe { ptr::read(&src.alloc) };
+        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any + Sync + Send, A>;
         mem::forget(src);
-        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) }, alloc)
+        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
     }
 }
 
-impl<T: ?Sized> RcBox<T> {
+impl<T: ?Sized, A: Allocator> RcBox<T, A> {
     /// Deallocates an `RcBox`
     ///
     /// `meta` will be dropped, but `data` must have already been dropped in place.
@@ -851,23 +851,27 @@ impl<T: ?Sized> RcBox<T> {
     /// # Safety
     /// The allocation must have been previously allocated with `RcBox::allocate_*()`.
     #[inline]
-    unsafe fn dealloc<A: Allocator>(ptr: NonNull<RcBox<T>>, alloc: &A) {
+    unsafe fn dealloc(ptr: NonNull<RcBox<T, A>>) {
         unsafe { ptr::addr_of_mut!((*ptr.as_ptr()).rcword).drop_in_place() };
         let layout = Layout::for_value(unsafe { ptr.as_ref() });
+        // Move `alloc` out of the block before freeing it -- it needs to be used to actually
+        // perform the deallocation, and (if it holds real resources, e.g. an `Arc`) properly
+        // dropped afterward as an ordinary owned local, independent of the memory it just freed.
+        let alloc = unsafe { ptr::read(ptr::addr_of!((*ptr.as_ptr()).alloc)) };
         let data_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr().cast::<u8>()) };
         unsafe { alloc.deallocate(data_ptr, layout) };
     }
 
-    /// Get the pointer to a `RcBox<T>` from a pointer to the data
+    /// Get the pointer to a `RcBox<T, A>` from a pointer to the data
     ///
     /// # Safety
     ///
     /// The pointer must point to (and have valid metadata for) the data part of a previously
-    /// valid instance of `RcBox<T>` and it must not be dangling.
+    /// valid instance of `RcBox<T, A>` and it must not be dangling.
     #[inline]
-    unsafe fn ptr_from_data_ptr(ptr: *const T) -> *const RcBox<T> {
-        // Calculate layout of RcBox<T> without `data` tail, but including padding
-        let base_layout = Layout::new::<RcBox<()>>();
+    unsafe fn ptr_from_data_ptr(ptr: *const T) -> *const RcBox<T, A> {
+        // Calculate layout of RcBox<T, A> without `data` tail, but including padding
+        let base_layout = Layout::new::<RcBox<(), A>>();
         // Safety: covered by the safety contract above
         let value_alignment = mem::align_of_val(unsafe { &*ptr });
         let value_offset_layout =
@@ -877,29 +881,32 @@ impl<T: ?Sized> RcBox<T> {
             .expect("invalid memory layout")
             .0;
 
-        // Move pointer to point to the start of the original RcBox<T>
+        // Move pointer to point to the start of the original RcBox<T, A>
         // Safety: covered by the safety contract above
         let rcbox = unsafe { ptr.cast::<u8>().offset(-(layout.size() as isize)) };
-        set_ptr_value(ptr, rcbox as *mut u8) as *const RcBox<T>
+        set_ptr_value(ptr, rcbox as *mut u8) as *const RcBox<T, A>
     }
 }
 
-impl<T> RcBox<T> {
+impl<T, A: Allocator> RcBox<T, A> {
     /// Tries to allocate an `RcBox`
     ///
     /// Returns a mutable reference with arbitrary lifetime on success and the memory layout that
     /// could not be allocated if the allocation failed.
     #[inline]
-    fn try_allocate<A: Allocator>(
+    fn try_allocate(
         meta: RcWord,
-        alloc: &A,
-    ) -> Result<NonNull<RcBox<mem::MaybeUninit<T>>>, Layout> {
-        let layout = Layout::new::<RcBox<T>>();
+        alloc: A,
+    ) -> Result<NonNull<RcBox<mem::MaybeUninit<T>, A>>, Layout> {
+        let layout = Layout::new::<RcBox<T, A>>();
 
         match alloc.allocate(layout) {
             Ok(ptr) => {
-                let ptr = ptr.cast::<RcBox<mem::MaybeUninit<T>>>();
-                unsafe { ptr::addr_of_mut!((*ptr.as_ptr()).rcword).write(meta) };
+                let ptr = ptr.cast::<RcBox<mem::MaybeUninit<T>, A>>();
+                unsafe {
+                    ptr::addr_of_mut!((*ptr.as_ptr()).rcword).write(meta);
+                    ptr::addr_of_mut!((*ptr.as_ptr()).alloc).write(alloc);
+                }
                 Ok(ptr)
             }
             Err(ApiAllocError) => Err(layout),
@@ -913,7 +920,7 @@ impl<T> RcBox<T> {
     /// # Panics
     /// Panics or aborts if the allocation failed.
     #[inline]
-    fn allocate<A: Allocator>(meta: RcWord, alloc: &A) -> NonNull<RcBox<mem::MaybeUninit<T>>> {
+    fn allocate(meta: RcWord, alloc: A) -> NonNull<RcBox<mem::MaybeUninit<T>, A>> {
         match Self::try_allocate(meta, alloc) {
             Ok(result) => result,
             Err(layout) => alloc::handle_alloc_error(layout),
@@ -925,14 +932,14 @@ impl<T> RcBox<T> {
     /// Returns a mutable reference with arbitrary lifetime on success and the memory layout that
     /// could not be allocated if the allocation failed or the layout calculation overflowed.
     #[inline]
-    fn try_allocate_slice<'a, A: Allocator>(
+    fn try_allocate_slice<'a>(
         meta: RcWord,
         len: usize,
         zeroed: bool,
-        alloc: &A,
-    ) -> Result<&'a mut RcBox<[mem::MaybeUninit<T>]>, Layout> {
+        alloc: A,
+    ) -> Result<&'a mut RcBox<[mem::MaybeUninit<T>], A>, Layout> {
         // Calculate memory layout
-        let layout = Layout::new::<RcBox<[T; 0]>>();
+        let layout = Layout::new::<RcBox<[T; 0], A>>();
         let payload_layout = Layout::array::<T>(len).map_err(|_| layout)?;
         let layout = layout
             .extend(payload_layout)
@@ -956,10 +963,13 @@ impl<T> RcBox<T> {
         // The immediate slice reference [MaybeUninit<u8>] *should* be sound
         let data_ptr = ptr.as_ptr() as *mut u8;
         let ptr = ptr::slice_from_raw_parts_mut(data_ptr.cast::<mem::MaybeUninit<u8>>(), len)
-            as *mut RcBox<[mem::MaybeUninit<T>]>;
+            as *mut RcBox<[mem::MaybeUninit<T>], A>;
 
-        // Initialize metadata field and return result
-        unsafe { ptr::addr_of_mut!((*ptr).rcword).write(meta) };
+        // Initialize header fields and return result
+        unsafe {
+            ptr::addr_of_mut!((*ptr).rcword).write(meta);
+            ptr::addr_of_mut!((*ptr).alloc).write(alloc);
+        }
         Ok(unsafe { ptr.as_mut().unwrap() })
     }
 
@@ -970,12 +980,12 @@ impl<T> RcBox<T> {
     /// # Panics
     /// Panics or aborts if the allocation failed or the memory layout calculation overflowed.
     #[inline]
-    fn allocate_slice<'a, A: Allocator>(
+    fn allocate_slice<'a>(
         meta: RcWord,
         len: usize,
         zeroed: bool,
-        alloc: &A,
-    ) -> &'a mut RcBox<[mem::MaybeUninit<T>]> {
+        alloc: A,
+    ) -> &'a mut RcBox<[mem::MaybeUninit<T>], A> {
         match Self::try_allocate_slice(meta, len, zeroed, alloc) {
             Ok(result) => result,
             Err(layout) => alloc::handle_alloc_error(layout),
@@ -983,26 +993,26 @@ impl<T> RcBox<T> {
     }
 }
 
-impl<T> RcBox<mem::MaybeUninit<T>> {
+impl<T, A> RcBox<mem::MaybeUninit<T>, A> {
     /// Converts to a mutable reference without the `MaybeUninit` wrapper.
     ///
     /// # Safety
     /// The payload must have been fully initialized or this causes immediate undefined behaviour.
     #[inline]
-    unsafe fn assume_init(&mut self) -> &mut RcBox<T> {
-        unsafe { (self as *mut Self).cast::<RcBox<T>>().as_mut() }.unwrap()
+    unsafe fn assume_init(&mut self) -> &mut RcBox<T, A> {
+        unsafe { (self as *mut Self).cast::<RcBox<T, A>>().as_mut() }.unwrap()
     }
 }
 
-impl<T> RcBox<[mem::MaybeUninit<T>]> {
+impl<T, A> RcBox<[mem::MaybeUninit<T>], A> {
     /// Converts to a mutable reference without the `MaybeUninit` wrapper.
     ///
     /// # Safety
     /// The payload slice must have been fully initialized or this causes immediate undefined
     /// behaviour.
     #[inline]
-    unsafe fn assume_init(&mut self) -> &mut RcBox<[T]> {
-        unsafe { (self as *mut _ as *mut RcBox<[T]>).as_mut() }.unwrap()
+    unsafe fn assume_init(&mut self) -> &mut RcBox<[T], A> {
+        unsafe { (self as *mut _ as *mut RcBox<[T], A>).as_mut() }.unwrap()
     }
 }
 
@@ -1022,8 +1032,7 @@ fn set_ptr_value<T: ?Sized, U>(mut meta_ptr: *const T, addr_ptr: *mut U) -> *mut
 }
 
 pub struct BiasedRc<T: ?Sized + 'static, A: Allocator + Clone + 'static = Global> {
-    ptr: NonNull<RcBox<T>>,
-    alloc: A,
+    ptr: NonNull<RcBox<T, A>>,
     phantom2: PhantomData<T>,
 }
 
@@ -1032,7 +1041,8 @@ impl<T: ?Sized + Clone, A: Allocator + Clone + 'static> BiasedRc<T, A> {
     pub fn make_mut(this: &mut Self) -> &mut T {
         if !this.get_box().has_unique_ref() {
             // Another pointer exists; clone
-            *this = Self::new_in(T::clone(this.data()), this.alloc.clone());
+            let alloc = this.get_box().alloc.clone();
+            *this = Self::new_in(T::clone(this.data()), alloc);
         }
 
         unsafe {
@@ -1048,16 +1058,15 @@ impl<T: ?Sized + Clone, A: Allocator + Clone + 'static> BiasedRc<T, A> {
 
 impl<T: ?Sized, A: Allocator + Clone + 'static> BiasedRc<T, A> {
     #[inline(always)]
-    fn from_inner(ptr: NonNull<RcBox<T>>, alloc: A) -> Self {
+    fn from_inner(ptr: NonNull<RcBox<T, A>>) -> Self {
         Self {
             ptr,
-            alloc,
             phantom2: PhantomData,
         }
     }
 
     #[inline(always)]
-    fn get_box(&self) -> &RcBox<T> {
+    fn get_box(&self) -> &RcBox<T, A> {
         unsafe { &(*self.ptr.as_ptr()) }
     }
 
@@ -1113,14 +1122,11 @@ impl<T: ?Sized, A: Allocator + Clone + 'static> BiasedRc<T, A> {
         ptr
     }
 
-    /// # Safety
-    /// `alloc` must be the same allocator (or an equivalent one) that originally produced `ptr`
-    /// via `into_raw`, otherwise `dealloc` will run against the wrong allocator.
-    pub unsafe fn from_raw(ptr: *const T, alloc: A) -> Self {
+    pub unsafe fn from_raw(ptr: *const T) -> Self {
         // Safety: covered by the safety contract for this function
-        let box_ptr = unsafe { RcBox::<T>::ptr_from_data_ptr(ptr) };
+        let box_ptr = unsafe { RcBox::<T, A>::ptr_from_data_ptr(ptr) };
 
-        Self::from_inner(NonNull::new(box_ptr as *mut _).expect("invalid pointer"), alloc)
+        Self::from_inner(NonNull::new(box_ptr as *mut _).expect("invalid pointer"))
     }
 
     #[inline]
@@ -1183,7 +1189,7 @@ impl<T: ?Sized, A: Allocator + Clone + 'static> BiasedRc<T, A> {
 
         // Safety: only called if this was the last (weak) reference
         unsafe {
-            RcBox::dealloc(self.ptr, &self.alloc);
+            RcBox::dealloc(self.ptr);
         }
     }
 }
@@ -1230,47 +1236,44 @@ impl<T> BiasedRc<T> {
 impl<T, A: Allocator + Clone + 'static> BiasedRc<T, A> {
     #[inline]
     pub fn new_in(data: T, alloc: A) -> Self {
-        let mut inner = RcBox::allocate(Self::build_new_meta(), &alloc);
+        let mut inner = RcBox::allocate(Self::build_new_meta(), alloc);
         let inner_mut = unsafe { inner.as_mut() };
         inner_mut.data.write(data);
-        Self::from_inner(unsafe { inner_mut.assume_init() }.into(), alloc)
+        Self::from_inner(unsafe { inner_mut.assume_init() }.into())
     }
 
     #[inline]
     pub fn new_uninit_in(alloc: A) -> BiasedRc<mem::MaybeUninit<T>, A> {
-        let inner = RcBox::allocate(Self::build_new_meta(), &alloc);
-        BiasedRc::from_inner(inner, alloc)
+        let inner = RcBox::allocate(Self::build_new_meta(), alloc);
+        BiasedRc::from_inner(inner)
     }
 
     #[inline]
     pub fn new_zeroed_in(alloc: A) -> BiasedRc<mem::MaybeUninit<T>, A> {
-        let mut inner = RcBox::allocate(Self::build_new_meta(), &alloc);
+        let mut inner = RcBox::allocate(Self::build_new_meta(), alloc);
         unsafe { inner.as_mut() }.data = mem::MaybeUninit::zeroed();
-        BiasedRc::from_inner(inner, alloc)
+        BiasedRc::from_inner(inner)
     }
 
     pub fn try_new_in(data: T, alloc: A) -> Result<Self, AllocError> {
         let mut inner =
-            RcBox::try_allocate(Self::build_new_meta(), &alloc).map_err(|_| AllocError)?;
+            RcBox::try_allocate(Self::build_new_meta(), alloc).map_err(|_| AllocError)?;
         let inner_mut = unsafe { inner.as_mut() };
         inner_mut.data.write(data);
-        Ok(Self::from_inner(
-            unsafe { inner_mut.assume_init() }.into(),
-            alloc,
-        ))
+        Ok(Self::from_inner(unsafe { inner_mut.assume_init() }.into()))
     }
 
     pub fn try_new_uninit_in(alloc: A) -> Result<BiasedRc<mem::MaybeUninit<T>, A>, AllocError> {
         let inner =
-            RcBox::try_allocate(Self::build_new_meta(), &alloc).map_err(|_| AllocError)?;
-        Ok(BiasedRc::from_inner(inner, alloc))
+            RcBox::try_allocate(Self::build_new_meta(), alloc).map_err(|_| AllocError)?;
+        Ok(BiasedRc::from_inner(inner))
     }
 
     pub fn try_new_zeroed_in(alloc: A) -> Result<BiasedRc<mem::MaybeUninit<T>, A>, AllocError> {
         let mut inner =
-            RcBox::try_allocate(Self::build_new_meta(), &alloc).map_err(|_| AllocError)?;
+            RcBox::try_allocate(Self::build_new_meta(), alloc).map_err(|_| AllocError)?;
         unsafe { inner.as_mut() }.data = mem::MaybeUninit::zeroed();
-        Ok(BiasedRc::from_inner(inner, alloc))
+        Ok(BiasedRc::from_inner(inner))
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
@@ -1305,7 +1308,7 @@ impl<T, A: Allocator + Clone + 'static> BiasedRc<T, A> {
             let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
 
             // Deallocate the box?
-            unsafe { RcBox::dealloc(this.ptr, &this.alloc) };
+            unsafe { RcBox::dealloc(this.ptr) };
 
             mem::forget(this);
 
@@ -1338,7 +1341,7 @@ impl<T, A: Allocator + Clone + 'static> BiasedRc<T, A> {
             // meta.thread_id.store(None, Ordering::Relaxed);
             let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
             // Deallocate the box?
-            unsafe { RcBox::dealloc(this.ptr, &this.alloc) };
+            unsafe { RcBox::dealloc(this.ptr) };
 
             mem::forget(this);
 
@@ -1394,7 +1397,7 @@ impl<T: ?Sized, A: Allocator + Clone + 'static> Clone for BiasedRc<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         self.get_box().increment();
-        Self::from_inner(self.ptr, self.alloc.clone())
+        Self::from_inner(self.ptr)
     }
 }
 
@@ -1503,22 +1506,22 @@ impl<T> BiasedRc<[T]> {
     /// Creates a new reference-counted slice with uninitialized contents.
     #[inline]
     pub fn new_uninit_slice(len: usize) -> BiasedRc<[mem::MaybeUninit<T>]> {
-        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false, &Global);
-        BiasedRc::from_inner(inner.into(), Global)
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false, Global);
+        BiasedRc::from_inner(inner.into())
     }
 
     /// Creates a new reference-counted slice with uninitialized contents, with the memory being
     /// filled with 0 bytes.
     #[inline]
     pub fn new_zeroed_slice(len: usize) -> BiasedRc<[mem::MaybeUninit<T>]> {
-        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, true, &Global);
-        BiasedRc::from_inner(inner.into(), Global)
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, true, Global);
+        BiasedRc::from_inner(inner.into())
     }
 
     #[inline]
     unsafe fn copy_from_slice_unchecked(src: &[T]) -> Self {
         let len = src.len();
-        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false, &Global);
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false, Global);
         let dest = ptr::addr_of_mut!((*inner).data).cast();
 
         // Safety: The freshly allocated `RcBox` can't alias `src` and the payload can be fully
@@ -1526,7 +1529,7 @@ impl<T> BiasedRc<[T]> {
         // requirements for calling this are fulfilled.
         unsafe {
             src.as_ptr().copy_to_nonoverlapping(dest, src.len());
-            BiasedRc::from_inner(inner.assume_init().into(), Global)
+            BiasedRc::from_inner(inner.assume_init().into())
         }
     }
 }
@@ -1541,7 +1544,7 @@ impl<T: Copy> BiasedRc<[T]> {
 
 #[must_use]
 pub(crate) struct SliceBuilder<'a, T> {
-    rcbox: &'a mut RcBox<[MaybeUninit<T>]>,
+    rcbox: &'a mut RcBox<[MaybeUninit<T>], Global>,
     n_elems: usize,
 }
 
@@ -1549,7 +1552,7 @@ impl<'a, T> SliceBuilder<'a, T> {
     /// Constructs a new builder for a `RcBox<[T]>` with a slice length of `length`
     #[inline]
     pub fn new(meta: RcWord, length: usize) -> Self {
-        let rcbox = RcBox::<T>::allocate_slice(meta, length, false, &Global);
+        let rcbox = RcBox::<T, Global>::allocate_slice(meta, length, false, Global);
         Self { rcbox, n_elems: 0 }
     }
 
@@ -1567,7 +1570,7 @@ impl<'a, T> SliceBuilder<'a, T> {
     /// # Panics
     /// Panics if the number of appended elements doesn't match the promised length.
     #[inline]
-    pub fn finish(self) -> &'a mut RcBox<[T]> {
+    pub fn finish(self) -> &'a mut RcBox<[T], Global> {
         assert_eq!(self.n_elems, self.rcbox.data.len());
         let rcbox: *mut _ = self.rcbox;
         std::mem::forget(self);
@@ -1588,7 +1591,7 @@ impl<T> Drop for SliceBuilder<'_, T> {
             drop_in_place(slice);
         }
         unsafe {
-            RcBox::dealloc(self.rcbox.into(), &Global);
+            RcBox::dealloc(self.rcbox.into());
         }
     }
 }
@@ -1607,7 +1610,7 @@ impl<T: Clone> From<&[T]> for BiasedRc<[T]> {
         for item in src {
             builder.append(Clone::clone(item));
         }
-        Self::from_inner(builder.finish().into(), Global)
+        Self::from_inner(builder.finish().into())
     }
 }
 
@@ -1629,9 +1632,10 @@ impl From<&str> for BiasedRc<str> {
     #[inline]
     fn from(src: &str) -> Self {
         let bytes = BiasedRc::<_>::copy_from_slice(src.as_bytes());
-        let inner = unsafe { (bytes.ptr.as_ptr() as *mut _ as *mut RcBox<str>).as_mut() }.unwrap();
+        let inner =
+            unsafe { (bytes.ptr.as_ptr() as *mut _ as *mut RcBox<str, Global>).as_mut() }.unwrap();
         mem::forget(bytes);
-        Self::from_inner(inner.into(), Global)
+        Self::from_inner(inner.into())
     }
 }
 
@@ -1675,6 +1679,18 @@ fn test_custom_allocator() {
     }
 
     register_thread();
+
+    // The whole point of storing `alloc` in the heap-allocated RcBox rather than the BiasedRc
+    // handle itself: the handle stays pointer-sized no matter how big `A` is (here, two Arcs --
+    // definitely not zero-sized), which is what keeps SteelVal::Custom under its size budget.
+    assert_eq!(
+        mem::size_of::<BiasedRc<i32, CountingAllocator>>(),
+        mem::size_of::<usize>()
+    );
+    assert_eq!(
+        mem::size_of::<BiasedRc<i32, CountingAllocator>>(),
+        mem::size_of::<BiasedRc<i32>>()
+    );
 
     let alloc = CountingAllocator {
         allocs: Arc::new(AtomicUsize::new(0)),
