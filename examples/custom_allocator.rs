@@ -14,6 +14,32 @@ use steel::SteelVal;
 use bumpalo::Bump;
 use steel_derive::Steel;
 
+// steel-core only depends on the `Allocator` trait (from `allocator-api2`) -- it has no
+// opinion on, or dependency on, which concrete allocator backs `ArenaAlloc::custom`. Picking
+// bumpalo, and making it thread-safe enough to hand over (`Bump` is `Send` but not `Sync`,
+// since it's built on `Cell`s), is entirely on us as the embedder.
+struct MutexBump(std::sync::Mutex<Bump>);
+
+unsafe impl allocator_api2::alloc::Allocator for MutexBump {
+    fn allocate(
+        &self,
+        layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        (&*self.0.lock().unwrap()).allocate(layout)
+    }
+
+    fn allocate_zeroed(
+        &self,
+        layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        (&*self.0.lock().unwrap()).allocate_zeroed(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
+        unsafe { (&*self.0.lock().unwrap()).deallocate(ptr, layout) }
+    }
+}
+
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static PANIC_ON_ALLOCATION: AtomicBool = AtomicBool::new(false);
 
@@ -148,5 +174,42 @@ fn main() {
 
     println!(
         "{arena_allocs} global allocations while building/cloning/dropping a Gc<i64, &Bump>"
+    );
+
+    // Put it all together: configure this engine's Custom-value allocator to a bump arena
+    // (instead of the default Global), then have the Steel-side script build a *fresh* Command
+    // value on every single call -- exercising the full path (the outer Gc/RcBox and the inner
+    // Box<dyn CustomType>, both routed through the arena) rather than reusing one built ahead
+    // of time like the very first loop above did.
+    engine.set_custom_value_arena(steel::gc::ArenaAlloc::custom(MutexBump(std::sync::Mutex::new(
+        Bump::with_capacity(1024 * 1024),
+    ))));
+
+    engine
+        .run(
+            "(define (on-command-fresh time) \
+               (push_command time (Command-Player (PlayerCommand-LoopBeats time))))",
+        )
+        .unwrap();
+
+    let before = ALLOCS.load(Relaxed);
+    PANIC_ON_ALLOCATION.store(true, Relaxed);
+    for i in 0..CALLS {
+        let mut args = [SteelVal::IntV(i as isize)];
+        engine
+            .call_function_by_name_with_args_from_mut_slice_in(
+                "on-command-fresh",
+                &mut args,
+                &bump_alloc,
+            )
+            .unwrap();
+        bump_alloc.reset();
+    }
+    PANIC_ON_ALLOCATION.store(false, Relaxed);
+    let fresh_allocs = ALLOCS.load(Relaxed) - before;
+
+    println!(
+        "{fresh_allocs} allocations over {CALLS} calls building a fresh Command each time ({:.2} per call)",
+        fresh_allocs as f64 / CALLS as f64
     );
 }
