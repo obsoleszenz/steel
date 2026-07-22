@@ -95,8 +95,6 @@ fn main() {
     // for a call-path allocation once PANIC_ON_ALLOCATION is armed below.
     REPORTING.with(|_| {});
 
-    let mut bump_alloc = Bump::with_capacity(1024);
-
     let mut engine = Engine::new();
     engine.register_fn("push_command", |time: u64, command: Command| {
         println!("time={time} command={command:?}");
@@ -125,6 +123,18 @@ fn main() {
     let loop_cmd: Command = engine.extract("loop-cmd").unwrap();
     println!("loop_cmd = {loop_cmd:?}");
 
+    // Configure this engine's Custom-value allocator to a bump arena (instead of the default
+    // Global) up front: every SteelVal::Custom construction, and the VM's own transient scratch
+    // allocations, made while this engine runs go through it from here on -- including the VM's
+    // own per-call scratch allocation, now that there's no separate `_in` allocator parameter.
+    // Sized generously (this arena is never reset below) so it comfortably outlasts both
+    // 10,000-iteration loops without ever needing to grow -- if it did, bumpalo would request a
+    // new chunk from the *global* allocator, which is exactly the syscall/lock this whole
+    // exercise is about avoiding.
+    engine.set_custom_value_arena(steel::gc::ArenaAlloc::custom(MutexBump(std::sync::Mutex::new(
+        Bump::with_capacity(16 * 1024 * 1024),
+    ))));
+
     const CALLS: u64 = 10_000;
 
     // Built once outside the hot loop: cloning a SteelVal wrapping a Custom value is just
@@ -138,13 +148,8 @@ fn main() {
     for i in 0..CALLS {
         let mut args = [SteelVal::IntV(i as isize), command_val.clone()];
         engine
-            .call_function_by_name_with_args_from_mut_slice_in(
-                "on-command",
-                &mut args,
-                &bump_alloc,
-            )
+            .call_function_by_name_with_args_from_mut_slice("on-command", &mut args)
             .unwrap();
-        bump_alloc.reset();
     }
     PANIC_ON_ALLOCATION.store(false, Relaxed);
     let allocs = ALLOCS.load(Relaxed) - before;
@@ -176,15 +181,9 @@ fn main() {
         "{arena_allocs} global allocations while building/cloning/dropping a Gc<i64, &Bump>"
     );
 
-    // Put it all together: configure this engine's Custom-value allocator to a bump arena
-    // (instead of the default Global), then have the Steel-side script build a *fresh* Command
-    // value on every single call -- exercising the full path (the outer Gc/RcBox and the inner
-    // Box<dyn CustomType>, both routed through the arena) rather than reusing one built ahead
-    // of time like the very first loop above did.
-    engine.set_custom_value_arena(steel::gc::ArenaAlloc::custom(MutexBump(std::sync::Mutex::new(
-        Bump::with_capacity(1024 * 1024),
-    ))));
-
+    // Now have the Steel-side script build a *fresh* Command value on every single call --
+    // exercising the full path (the outer Gc/RcBox and the inner Box<dyn CustomType>, both
+    // routed through the arena) rather than reusing one built ahead of time like the loop above.
     engine
         .run(
             "(define (on-command-fresh time) \
@@ -197,13 +196,8 @@ fn main() {
     for i in 0..CALLS {
         let mut args = [SteelVal::IntV(i as isize)];
         engine
-            .call_function_by_name_with_args_from_mut_slice_in(
-                "on-command-fresh",
-                &mut args,
-                &bump_alloc,
-            )
+            .call_function_by_name_with_args_from_mut_slice("on-command-fresh", &mut args)
             .unwrap();
-        bump_alloc.reset();
     }
     PANIC_ON_ALLOCATION.store(false, Relaxed);
     let fresh_allocs = ALLOCS.load(Relaxed) - before;

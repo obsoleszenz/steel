@@ -83,11 +83,6 @@ use smallvec::SmallVec;
 use steel_parser::interner::InternedString;
 use threads::ThreadHandle;
 
-#[cfg(not(feature = "nightly"))]
-use allocator_api2::alloc::{Allocator, Global};
-#[cfg(feature = "nightly")]
-use std::alloc::Allocator;
-
 use crate::core::utils::CollectIn;
 
 use crate::rvals::{into_serializable_value, IntoSteelVal};
@@ -1035,16 +1030,6 @@ impl SteelThread {
         function: SteelVal,
         args: &mut [SteelVal],
     ) -> Result<SteelVal> {
-        self.call_function_from_mut_slice_in(constant_map, function, args, Global)
-    }
-
-    pub(crate) fn call_function_from_mut_slice_in<A: Allocator + std::marker::Copy>(
-        &mut self,
-        constant_map: ConstantMap,
-        function: SteelVal,
-        args: &mut [SteelVal],
-        alloc: A,
-    ) -> Result<SteelVal> {
         match function {
             SteelVal::FuncV(func) => func(args).map_err(|x| x.set_span_if_none(Span::default())),
             SteelVal::BoxedFunction(func) => {
@@ -1062,14 +1047,9 @@ impl SteelThread {
             SteelVal::CustomStruct(ref s) => {
                 if let Some(procedure) = s.maybe_proc() {
                     if let SteelVal::HeapAllocated(h) = procedure {
-                        self.call_function_from_mut_slice_in(constant_map, h.get(), args, alloc)
+                        self.call_function_from_mut_slice(constant_map, h.get(), args)
                     } else {
-                        self.call_function_from_mut_slice_in(
-                            constant_map,
-                            procedure.clone(),
-                            args,
-                            alloc,
-                        )
+                        self.call_function_from_mut_slice(constant_map, procedure.clone(), args)
                     }
                 } else {
                     stop!(TypeMismatch => format!("application not a procedure: {function}"))
@@ -1077,15 +1057,36 @@ impl SteelThread {
             }
 
             SteelVal::Closure(closure) => {
-                // Create phony span vec, sourced from the caller-supplied allocator rather
-                // than the global one, since it's pure per-call scratch: current_span_for_index
-                // already falls back to Span::default() via a checked `.get(ip)`, so this never
-                // needs to outlive the call.
+                // Create phony span vec, sourced from this engine's configured Custom-value
+                // arena (Global by default) rather than always the system allocator directly --
+                // it's pure per-call scratch: current_span_for_index already falls back to
+                // Span::default() via a checked `.get(ip)`, so this never needs to outlive the
+                // call, same as any other transient allocation made during it.
+                #[cfg(all(
+                    feature = "sync",
+                    feature = "biased",
+                    feature = "allocator-api2",
+                    not(feature = "triomphe")
+                ))]
                 let spans = closure
                     .body_exp()
                     .iter()
                     .map(|_| Span::default())
-                    .collect_in::<allocator_api2::vec::Vec<_, A>>(alloc);
+                    .collect_in::<allocator_api2::vec::Vec<_, crate::gc::ArenaAlloc>>(
+                        self.custom_arena.clone(),
+                    );
+
+                #[cfg(not(all(
+                    feature = "sync",
+                    feature = "biased",
+                    feature = "allocator-api2",
+                    not(feature = "triomphe")
+                )))]
+                let spans = closure
+                    .body_exp()
+                    .iter()
+                    .map(|_| Span::default())
+                    .collect::<Vec<_>>();
 
                 let mut vm_instance = VmCore::new_unchecked(
                     // Shared::new([]),
