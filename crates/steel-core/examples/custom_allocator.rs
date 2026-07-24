@@ -99,6 +99,20 @@ const SCRIPT: &str = r#"
     (define history (box '()))
     (define event-count (box 0))
 
+    ;; Global app state. `state` starts unset; `init` sets it up -- call it
+    ;; once, on the real-time engine, before feeding it any events. Kept
+    ;; as a plain box rather than a `(struct ...)`: struct's generated
+    ;; constructor currently goes through a Global-only built-in, which
+    ;; isn't supported yet under a custom allocator.
+    (define state (box #f))
+
+    (define (init)
+      (set-box! state #f)) ;; is-shift-pressed = #f
+
+    (define (is-shift-pressed?) (unbox state))
+
+    (define (set-shift-pressed! pressed) (set-box! state pressed))
+
     (define (clamp value low high)
       (if (<= value low)
           low
@@ -146,6 +160,10 @@ fn main() -> steel::rvals::Result<()> {
     // and every closure/box/cons cell it needs get constructed for the first time, all
     // through `bump` rather than the global allocator.
     realtime_engine.run_executable(&executable)?;
+
+    // Now that `init` is defined (as a global in `realtime_engine`'s own environment), call it
+    // to actually construct the `AppState` instance -- also allocated through `bump`.
+    realtime_engine.call_function_by_name_with_args("init", vec![])?;
 
     println!("bytes allocated after setup: {}", bump.bytes_used());
 
