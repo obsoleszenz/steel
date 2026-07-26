@@ -81,7 +81,6 @@ macro_rules! list {
 
 use bigdecimal::BigDecimal;
 use parking_lot::RwLock;
-use smallvec::SmallVec;
 use crate::rvals::SteelValGeneric::*;
 
 use crate::values::{HashMap, HashSet, Vector};
@@ -1160,22 +1159,14 @@ pub fn from_serializable_value(
         )))),
         SerializableSteelVal::SymbolV(s) => Ok(SteelVal::SymbolV(s.into())),
         SerializableSteelVal::CustomStruct(s) => {
+            let mut fields = crate::values::functions::empty_captures_in(crate::gc::Global);
+
+            for value in s.fields.into_iter().map(|x| from_serializable_value(ctx, x)) {
+                fields.push(value?);
+            }
+
             Ok(SteelVal::CustomStruct(Gc::new(UserDefinedStruct {
-                fields: {
-                    let fields = s
-                        .fields
-                        .into_iter()
-                        .map(|x| from_serializable_value(ctx, x));
-
-                    let mut recycle: crate::values::recycler::Recycle<SmallVec<_>> =
-                        crate::values::recycler::Recycle::new();
-
-                    for value in fields {
-                        recycle.push(value?);
-                    }
-
-                    recycle
-                },
+                fields,
                 type_descriptor: s.type_descriptor,
             })))
         }
@@ -1747,7 +1738,7 @@ pub enum SteelValGeneric<A: crate::gc::Allocator + Clone + Send + Sync + 'static
     // Embedded HashSet
     HashSetV(SteelHashSet<A>),
     /// Represents a scheme-only struct
-    CustomStruct(Gc<UserDefinedStruct>),
+    CustomStruct(crate::values::structs::UserDefinedStructGc<A>),
     /// Represents a port object
     PortV(SteelPort),
     /// Generic iterator wrapper

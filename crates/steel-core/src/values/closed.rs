@@ -2762,11 +2762,12 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
     // TODO: Revisit this
     fn visit_reference_value(&mut self, _reference: Gc<OpaqueReference<'static>>) -> Self::Output {}
 
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
-        // `UserDefinedStruct`'s fields are always the concrete `SteelVal` (`Global`),
-        // regardless of this context's own `A` -- see ALLOCATOR_SPEC.md.
+    fn visit_steel_struct(
+        &mut self,
+        steel_struct: crate::values::structs::UserDefinedStructGc<A>,
+    ) -> Self::Output {
         for field in steel_struct.fields.iter() {
-            push_concrete_into_mark(self, field.clone());
+            self.push_back(field.clone());
         }
     }
 

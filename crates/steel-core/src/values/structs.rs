@@ -7,14 +7,13 @@ use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 use crate::compiler::map::SymbolMap;
 use crate::parser::interner::InternedString;
 use crate::rerrs::ErrorKind;
 use crate::rvals::{
     from_serializable_value, into_serializable_value, Custom, HeapSerializer, SerializableSteelVal,
-    SerializationContext, SerializedHeapRef, SteelHashMap,
+    SerializationContext, SerializedHeapRef, SteelHashMap, SteelValGeneric,
 };
 use crate::rvals::{FromSteelVal, IntoSteelVal};
 use crate::steel_vm::register_fn::RegisterFn;
@@ -40,7 +39,6 @@ use std::{
 use super::closed::Heap;
 use super::functions::BoxedDynFunction;
 use super::lists::List;
-use super::recycler::Recycle;
 
 enum StringOrMagicNumber {
     String(Rc<String>),
@@ -157,17 +155,62 @@ pub struct SerializableUserDefinedStruct {
     pub(crate) type_descriptor: StructTypeDescriptor,
 }
 
-#[derive(Clone, Debug)]
-pub struct UserDefinedStruct {
-    // pub(crate) fields: Recycle<Vec<SteelVal>>,
-    pub(crate) fields: Recycle<SmallVec<[SteelVal; 4]>>,
-    // pub(crate) fields: SmallVec<[SteelVal; 4]>,
+// Only the gated combo actually routes a struct's own `Gc` box through `A` -- same split as
+// `ByteCodeLambdaGc<A>` (see values/functions.rs), and for the same reason: everywhere else,
+// `Gc<T, A>` (the 2-parameter form) doesn't exist at all.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub type UserDefinedStructGc<A> = Gc<UserDefinedStruct<A>, A>;
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub type UserDefinedStructGc<A> = Gc<UserDefinedStruct<A>>;
+
+/// Generic over `A` so a mutable struct's fields -- which are plain `box`ed values (see
+/// `kernel.scm`'s `struct-impl`, which wraps every field of a `#:mutable` struct in `(#%box
+/// ...)`) -- can hold content actually built through the caller's own allocator, instead of
+/// forcing every struct field down to `Global` regardless of what allocator constructed the
+/// struct itself.
+pub struct UserDefinedStruct<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global>
+{
+    pub(crate) fields: crate::values::functions::CaptureVec<A>,
 
     // Type Descriptor. Use this as an index into the VTable to find anything that we need.
     pub(crate) type_descriptor: StructTypeDescriptor,
 }
 
-impl UserDefinedStruct {
+// Not derived: a derived `Debug`/`Clone` would add an `A: Debug`/`A: Clone` bound to the
+// whole impl even though `A` only shows up inside `fields`' element type -- `Global` happens
+// to satisfy both, but a real custom allocator generally only needs to satisfy `Clone` (which
+// the trait bound on `A` already guarantees), not `Debug`. Same reasoning as
+// `ByteCodeLambda<A>`'s manual `Debug` impl.
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for UserDefinedStruct<A> {
+    fn clone(&self) -> Self {
+        Self {
+            fields: self.fields.clone(),
+            type_descriptor: self.type_descriptor,
+        }
+    }
+}
+
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for UserDefinedStruct<A> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserDefinedStruct")
+            .field("fields", &self.fields.iter().collect::<Vec<_>>())
+            .field("type_descriptor", &self.type_descriptor)
+            .finish()
+    }
+}
+
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> UserDefinedStruct<A> {
     pub fn name(&self) -> InternedString {
         self.type_descriptor.name()
     }
@@ -177,7 +220,12 @@ impl UserDefinedStruct {
             .and_then(|x| x.as_bool())
             .unwrap_or_default()
     }
+}
 
+// Unused anywhere in this crate today (no internal callers), and `get_mut_index` leans on
+// `steel_unbox_mutable`, which only operates on concrete `SteelVal` -- kept Global-only rather
+// than threading a generic unbox helper through for dead code.
+impl UserDefinedStruct<crate::gc::Global> {
     pub fn get_index(&self, index: usize) -> Option<&SteelVal> {
         self.fields.get(index)
     }
@@ -200,20 +248,20 @@ impl UserDefinedStruct {
 }
 
 // TODO: This could blow the stack for big trees...
-impl PartialEq for UserDefinedStruct {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for UserDefinedStruct<A> {
     fn eq(&self, other: &Self) -> bool {
         self.type_descriptor == other.type_descriptor && self.fields.deref() == other.fields.deref()
     }
 }
 
-impl Hash for UserDefinedStruct {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Hash for UserDefinedStruct<A> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.type_descriptor.hash(state);
         self.fields.deref().hash(state);
     }
 }
 
-impl core::fmt::Display for UserDefinedStruct {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Display for UserDefinedStruct<A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self
             .get(&SteelVal::SymbolV(SteelString::from("#:transparent")))
@@ -235,21 +283,7 @@ impl core::fmt::Display for UserDefinedStruct {
     }
 }
 
-impl UserDefinedStruct {
-    fn new(type_descriptor: StructTypeDescriptor, raw_fields: &[SteelVal]) -> Self {
-        // let mut fields: Recycle<Vec<_>> = Recycle::new();
-        let mut fields: Recycle<SmallVec<[SteelVal; 4]>> = Recycle::new();
-        // fields.extend_from_slice(raw_fields);
-        fields.extend(raw_fields.iter().cloned());
-
-        // let fields = raw_fields.into_iter().cloned().collect();
-
-        Self {
-            fields,
-            type_descriptor,
-        }
-    }
-
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> UserDefinedStruct<A> {
     #[cfg(not(feature = "sync"))]
     pub(crate) fn get(&self, val: &SteelVal) -> Option<SteelVal> {
         VTABLE.with(|x| {
@@ -266,6 +300,36 @@ impl UserDefinedStruct {
             .properties
             .get(val)
             .cloned()
+    }
+
+    #[cfg(not(feature = "sync"))]
+    pub(crate) fn maybe_proc(&self) -> Option<&SteelValGeneric<A>> {
+        VTABLE.with(|x| {
+            x.borrow().entries[self.type_descriptor.0]
+                .proc
+                .as_ref()
+                .map(|s| &self.fields[*s])
+        })
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn maybe_proc(&self) -> Option<&SteelValGeneric<A>> {
+        STATIC_VTABLE.read().entries[self.type_descriptor.0]
+            .proc
+            .as_ref()
+            .map(|s| &self.fields[*s])
+    }
+}
+
+impl UserDefinedStruct<crate::gc::Global> {
+    fn new(type_descriptor: StructTypeDescriptor, raw_fields: &[SteelVal]) -> Self {
+        let mut fields = crate::values::functions::empty_captures_in(crate::gc::Global);
+        fields.extend(raw_fields.iter().cloned());
+
+        Self {
+            fields,
+            type_descriptor,
+        }
     }
 
     #[inline(always)]
@@ -302,36 +366,14 @@ impl UserDefinedStruct {
         self.type_descriptor.name() == *ERR_RESULT_LABEL
     }
 
-    #[cfg(not(feature = "sync"))]
-    pub(crate) fn maybe_proc(&self) -> Option<&SteelVal> {
-        VTABLE.with(|x| {
-            x.borrow().entries[self.type_descriptor.0]
-                .proc
-                .as_ref()
-                .map(|s| &self.fields[*s])
-        })
-    }
-
-    #[cfg(feature = "sync")]
-    pub(crate) fn maybe_proc(&self) -> Option<&SteelVal> {
-        STATIC_VTABLE.read().entries[self.type_descriptor.0]
-            .proc
-            .as_ref()
-            .map(|s| &self.fields[*s])
-    }
-
     fn new_with_options(
         properties: Properties,
         type_descriptor: StructTypeDescriptor,
         rest: &[SteelVal],
     ) -> Self {
-        // let mut fields: Recycle<Vec<_>> = Recycle::new_with_capacity(rest.len());
-        // fields.extend_from_slice(rest);
-
-        let mut fields: Recycle<SmallVec<[_; 4]>> = Recycle::new_with_capacity(rest.len());
+        let mut fields =
+            crate::values::functions::captures_with_capacity_in(rest.len(), crate::gc::Global);
         fields.extend(rest.iter().cloned());
-
-        // let fields = rest.into_iter().cloned().collect();
 
         Self {
             fields,

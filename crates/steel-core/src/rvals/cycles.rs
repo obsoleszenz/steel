@@ -44,32 +44,6 @@ where
     }
 }
 
-/// Reinterprets a reference to a known-concrete `SteelVal` (e.g. a
-/// `UserDefinedStruct` field) as `&SteelValGeneric<A>` when `A` is actually `Global`,
-/// via the same `TypeId`-proven identity cast as `push_concrete_into` -- but for a
-/// shared reference, so there's no ownership/drop subtlety at all, just reinterpreting
-/// the reference's type.
-///
-/// This matters for `CycleDetector::format_with_cycles` specifically: recursing
-/// through it (rather than formatting the field in total isolation, e.g. via its own
-/// `Display` impl) is what shares `self`'s cycle-tracking state with the field being
-/// printed. A struct field that points back into a structure already being printed
-/// (e.g. a doubly-linked list's `prev`/`next` -- a real cycle, not just deep nesting)
-/// needs that shared state to be recognized and broken (`#N#`); without it, printing
-/// recurses forever between the two sides of the cycle.
-fn as_generic_ref<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
-    value: &SteelVal,
-) -> Option<&SteelValGeneric<A>> {
-    if core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>() {
-        // Safety: just proved `A == Global` via `TypeId`, so `SteelValGeneric<A>` and
-        // `SteelVal` are identically the same type -- this reinterprets a reference as
-        // its own type, nothing more.
-        Some(unsafe { core::mem::transmute::<&SteelVal, &SteelValGeneric<A>>(value) })
-    } else {
-        None
-    }
-}
-
 #[derive(Default)]
 // Keep track of any reference counted values that are visited, in a pointer
 pub(super) struct CycleDetector<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
@@ -310,11 +284,7 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> CycleDetector<A> {
 
                                 for i in guard.fields.iter() {
                                     write!(f, " ")?;
-                                    if let Some(i) = as_generic_ref(i) {
-                                        self.format_with_cycles(i, f, FormatType::Normal)?;
-                                    } else {
-                                        write!(f, "{i}")?;
-                                    }
+                                    self.format_with_cycles(i, f, FormatType::Normal)?;
                                 }
 
                                 write!(f, ")")
@@ -336,11 +306,7 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> CycleDetector<A> {
 
                             for i in guard.fields.iter() {
                                 write!(f, " ")?;
-                                if let Some(i) = as_generic_ref(i) {
-                                    self.format_with_cycles(i, f, FormatType::Normal)?;
-                                } else {
-                                    write!(f, "{i}")?;
-                                }
+                                self.format_with_cycles(i, f, FormatType::Normal)?;
                             }
 
                             write!(f, ")")
@@ -694,20 +660,21 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
         }
     }
 
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
-        // `UserDefinedStruct`'s fields are always the concrete `SteelVal` (`Global`),
-        // regardless of this collector's own `A`. Pushed into this same collector's
-        // own queue via `push_concrete_into` (not skipped) -- this cycle-detection
-        // pre-pass has to actually walk into struct fields to discover cycles that
-        // pass through them (e.g. a doubly-linked list's `prev`/`next`); skipping them
-        // means `self.cycles` never gets an entry for such a cycle, and the later
-        // formatting pass that relies on it recurses forever between the two sides.
+    fn visit_steel_struct(
+        &mut self,
+        steel_struct: crate::values::structs::UserDefinedStructGc<A>,
+    ) -> Self::Output {
+        // This cycle-detection pre-pass has to actually walk into struct fields to
+        // discover cycles that pass through them (e.g. a doubly-linked list's
+        // `prev`/`next`); skipping them means `self.cycles` never gets an entry for
+        // such a cycle, and the later formatting pass that relies on it recurses
+        // forever between the two sides.
         if !self.add(
             (steel_struct.as_ptr() as usize, 0),
             &SteelValGeneric::CustomStruct(steel_struct.clone()),
         ) {
             for value in steel_struct.fields.iter() {
-                push_concrete_into(self, value.clone());
+                self.push_back(value.clone());
             }
         }
     }
@@ -843,35 +810,18 @@ pub(crate) mod drop_impls {
         }
     }
 
-    impl Drop for UserDefinedStruct {
+    // `DROP_BUFFER`'s thread-local reuse optimization only applies to the concrete
+    // `Global` case (see the comment above it) -- generic `A` always allocates a fresh
+    // queue, same as `SteelVector<A>`/`SteelHashMap<A>` above.
+    impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Drop for UserDefinedStruct<A> {
         fn drop(&mut self) {
             if self.fields.is_empty() {
                 return;
             }
 
-            if DROP_BUFFER
-                .try_with(|drop_buffer| {
-                    if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
-                        // for value in core::mem::take(&mut self.fields) {
-                        //     drop_buffer.push_back(value);
-                        // }
-
-                        drop_buffer.extend(
-                            self.fields.drain(..),
-                            // core::mem::replace(&mut self.fields, Recycle::noop()).into_iter(),
-                        );
-
-                        // core::mem::replace(&mut self, self.fields.put();
-
-                        IterativeDropHandler::bfs(&mut drop_buffer);
-                    }
-                })
-                .is_err()
-            {
-                let mut buffer = self.fields.drain(..).collect();
-
-                IterativeDropHandler::bfs(&mut buffer);
-            }
+            let mut drop_buffer = VecDeque::new();
+            drop_buffer.extend(self.fields.drain(..));
+            IterativeDropHandler::bfs(&mut drop_buffer);
         }
     }
 
@@ -1025,17 +975,14 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
         }
     }
 
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) {
-        // `UserDefinedStruct`'s fields are always the concrete `SteelVal` (`Global`),
-        // regardless of this handler's own `A` (see ALLOCATOR_SPEC.md -- its
-        // thread-local-pooled field storage can't be made generic over `A`). Pushed
-        // into this same handler's own queue via `push_concrete_into` (not a nested
-        // drop pass) -- required for correctness, not just style: a long chain of
-        // structs (e.g. a doubly-linked list) would otherwise recurse one Rust stack
-        // frame per link instead of running through the shared queue.
+    fn visit_steel_struct(&mut self, steel_struct: crate::values::structs::UserDefinedStructGc<A>) {
+        // Pushed into this same handler's own queue directly (not a nested drop pass)
+        // -- required for correctness, not just style: a long chain of structs (e.g. a
+        // doubly-linked list) would otherwise recurse one Rust stack frame per link
+        // instead of running through the shared queue.
         if let Ok(mut inner) = steel_struct.try_unwrap() {
             for value in inner.fields.drain(..) {
-                push_concrete_into(self, value);
+                self.push_back(value);
             }
         }
     }
@@ -1403,17 +1350,14 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSearch
         }
     }
 
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) {
-        // `UserDefinedStruct`'s fields are always the concrete `SteelVal` (`Global`),
-        // regardless of this handler's own `A` (see ALLOCATOR_SPEC.md -- its
-        // thread-local-pooled field storage can't be made generic over `A`). Pushed
-        // into this same handler's own queue via `push_concrete_into` (not a nested
-        // drop pass) -- required for correctness, not just style: a long chain of
-        // structs (e.g. a doubly-linked list) would otherwise recurse one Rust stack
-        // frame per link instead of running through the shared queue.
+    fn visit_steel_struct(&mut self, steel_struct: crate::values::structs::UserDefinedStructGc<A>) {
+        // Pushed into this same handler's own queue directly (not a nested drop pass)
+        // -- required for correctness, not just style: a long chain of structs (e.g. a
+        // doubly-linked list) would otherwise recurse one Rust stack frame per link
+        // instead of running through the shared queue.
         if let Ok(mut inner) = steel_struct.try_unwrap() {
             for value in inner.fields.drain(..) {
-                push_concrete_into(self, value);
+                self.push_back(value);
             }
         }
     }
@@ -1690,7 +1634,7 @@ pub trait BreadthFirstSearchSteelValVisitor<A: crate::gc::Allocator + Clone + Se
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: SteelHashMap<A>) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: SteelHashSet<A>) -> Self::Output;
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output;
+    fn visit_steel_struct(&mut self, steel_struct: crate::values::structs::UserDefinedStructGc<A>) -> Self::Output;
     fn visit_port(&mut self, port: SteelPort) -> Self::Output;
     fn visit_transducer(&mut self, transducer: Gc<Transducer<A>>) -> Self::Output;
     fn visit_reducer(&mut self, reducer: Gc<Reducer<A>>) -> Self::Output;
@@ -1786,7 +1730,7 @@ pub trait BreadthFirstSearchSteelValVisitor2<A: crate::gc::Allocator + Clone + S
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: SteelHashMap<A>) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: SteelHashSet<A>) -> Self::Output;
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output;
+    fn visit_steel_struct(&mut self, steel_struct: crate::values::structs::UserDefinedStructGc<A>) -> Self::Output;
     fn visit_port(&mut self, port: SteelPort) -> Self::Output;
     fn visit_transducer(&mut self, transducer: Gc<Transducer<A>>) -> Self::Output;
     fn visit_reducer(&mut self, reducer: Gc<Reducer<A>>) -> Self::Output;
@@ -1883,7 +1827,7 @@ pub trait BreadthFirstSearchSteelValReferenceVisitor<'a, A: crate::gc::Allocator
     fn visit_custom_type(&mut self, custom_type: &'a GcMut<Box<dyn CustomType>>) -> Self::Output;
     fn visit_hash_map(&mut self, hashmap: &'a SteelHashMap<A>) -> Self::Output;
     fn visit_hash_set(&mut self, hashset: &'a SteelHashSet<A>) -> Self::Output;
-    fn visit_steel_struct(&mut self, steel_struct: &'a Gc<UserDefinedStruct>) -> Self::Output;
+    fn visit_steel_struct(&mut self, steel_struct: &'a crate::values::structs::UserDefinedStructGc<A>) -> Self::Output;
     fn visit_port(&mut self, port: &'a SteelPort) -> Self::Output;
     fn visit_transducer(&mut self, transducer: &'a Gc<Transducer<A>>) -> Self::Output;
     fn visit_reducer(&mut self, reducer: &'a Gc<Reducer<A>>) -> Self::Output;
@@ -2320,20 +2264,18 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> RecursiveEqual
                             return false;
                         }
 
-                        // `UserDefinedStruct`'s fields are always the concrete
-                        // `SteelVal` (`Global`), regardless of this handler's own `A`.
-                        // Pushed pairwise into `self.left`/`self.right`'s own queues via
-                        // `push_concrete_into` (not compared directly) -- this handler's
-                        // shared `visited` set is what breaks a cycle passing through
-                        // struct fields (e.g. a doubly-linked list's `prev`/`next`);
-                        // comparing fields via a fresh, isolated PartialEq call would
-                        // recurse forever on such a cycle instead.
+                        // Pushed pairwise into `self.left`/`self.right`'s own queues
+                        // (not compared directly) -- this handler's shared `visited`
+                        // set is what breaks a cycle passing through struct fields
+                        // (e.g. a doubly-linked list's `prev`/`next`); comparing fields
+                        // via a fresh, isolated PartialEq call would recurse forever on
+                        // such a cycle instead.
                         if l.fields.len() != r.fields.len() {
                             return false;
                         }
                         for (lv, rv) in l.fields.iter().zip(r.fields.iter()) {
-                            push_concrete_into(&mut self.left, lv.clone());
-                            push_concrete_into(&mut self.right, rv.clone());
+                            self.left.push_back(lv.clone());
+                            self.right.push_back(rv.clone());
                         }
                     }
 
@@ -2551,7 +2493,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
     // Unreachable in practice: the `(CustomStruct(l), CustomStruct(r))` arm above
     // compares fields directly rather than dispatching through here, since they're
     // always the concrete `SteelVal` regardless of this handler's own `A`.
-    fn visit_steel_struct(&mut self, _steel_struct: Gc<UserDefinedStruct>) -> Self::Output {}
+    fn visit_steel_struct(&mut self, _steel_struct: crate::values::structs::UserDefinedStructGc<A>) -> Self::Output {}
 
     fn visit_transducer(&mut self, transducer: Gc<Transducer<A>>) -> Self::Output {
         for transducer in transducer.ops.iter() {

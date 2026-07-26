@@ -34,6 +34,7 @@ use crate::rvals::SteelString;
 use crate::rvals::{as_underlying_type, AsRefSteelValFromRef};
 use crate::values::closed::Heap;
 use crate::values::closed::MarkAndSweepContext;
+use crate::values::functions::BoxedDynFunction;
 use crate::values::functions::CaptureVec;
 use crate::values::functions::RootedInstructions;
 use crate::values::functions::SerializedLambda;
@@ -702,10 +703,65 @@ fn hot_path_builtin_dispatch<A: crate::gc::Allocator + Clone + Send + Sync + 'st
             &mut ctx.thread.synchronizer,
         );
 
-        Some(Ok(SteelValGeneric::HeapAllocated(allocated_var)))
-    } else {
-        None
+        return Some(Ok(SteelValGeneric::HeapAllocated(allocated_var)));
     }
+
+    // `(struct ...)`'s macro expansion pushes/reads/pops the current module path (used to
+    // build a hygienic, module-qualified struct type name) via these four built-ins. None of
+    // them touch anything Global-specific -- `module_context: Vec<SteelString<A>>` already
+    // lives on `SteelThread<A>`, and the only allocation involved is the returned string
+    // itself, which we build through `A` the same way `constant_to_generic` does.
+    if f == (get_module_context as BuiltInSignature) {
+        let last = ctx
+            .thread
+            .module_context
+            .last()
+            .cloned()
+            .map(SteelValGeneric::StringV)
+            .unwrap_or(SteelValGeneric::BoolV(false));
+
+        return Some(Ok(last));
+    }
+
+    if f == (get_module_relative_context as BuiltInSignature) {
+        let last = ctx
+            .thread
+            .module_context
+            .last()
+            .cloned()
+            .map(|x| std::path::PathBuf::from(x.as_str()));
+
+        let Some(last) = last else {
+            return Some(Ok(SteelValGeneric::BoolV(false)));
+        };
+
+        if cfg!(target_family = "wasm") {
+            return Some(Ok(SteelValGeneric::BoolV(false)));
+        }
+
+        let dirs = &ctx.thread.compiler.read().search_dirs;
+        let relative = crate::compiler::modules::fully_qualified_to_relative(last, dirs).unwrap();
+
+        return Some(Ok(SteelValGeneric::StringV(SteelString::new_in(
+            relative.to_str().unwrap(),
+            ctx.thread.alloc.clone(),
+        ))));
+    }
+
+    if f == (push_module_context as BuiltInSignature) {
+        if let [SteelValGeneric::StringV(s)] = args {
+            ctx.thread.module_context.push(s.clone());
+        }
+
+        return Some(Ok(SteelValGeneric::Void));
+    }
+
+    if f == (pop_module_context as BuiltInSignature) {
+        ctx.thread.module_context.pop();
+        return Some(Ok(SteelValGeneric::Void));
+    }
+
+    None
 }
 
 /// Same as `hot_path_native_dispatch`, for the (much smaller) set of hot-path natives
@@ -766,7 +822,7 @@ fn is_simple_numeric_slice<A: crate::gc::Allocator + Clone + Send + Sync + 'stat
 fn hot_path_native_dispatch<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
     f: crate::rvals::FunctionSignature,
     args: &mut [SteelValGeneric<A>],
-    _alloc: &A,
+    alloc: &A,
 ) -> Option<Result<SteelValGeneric<A>>> {
     type Sig = crate::rvals::FunctionSignature;
 
@@ -816,6 +872,53 @@ fn hot_path_native_dispatch<A: crate::gc::Allocator + Clone + Send + Sync + 'sta
         Some(number_equality_generic(&mut left, &mut right))
     } else if f == (crate::primitives::lists::steel_list_ref as Sig) {
         Some(list_ref_generic(args))
+    } else if f == (crate::primitives::hashmaps::hm_construct as Sig) {
+        // `(struct ...)`'s `#:mutable`-style options get bundled into a `(hash ...)` literal
+        // in the macro's own expansion. `HashMapV`'s outer `Gc` is unparametrized by `A`
+        // (only its persistent *node* storage is, per ALLOCATOR_SPEC.md's still-pending
+        // persistent-collections phase), and `SteelValGeneric<A>` is already `Hash + Eq`
+        // generically, so this is a mechanical port of `hm_construct`'s body, not a bridge.
+        Some(hm_construct_generic(args))
+    } else if f == (crate::values::structs::make_struct_type as Sig) {
+        // `(struct ...)` compiles down to a call to `make-struct-type`, whose generated
+        // constructor/predicate/getter closures are concrete `SteelVal::BoxedFunction`s
+        // registered into a process-wide table (`STRUCT_MAP`) keyed by struct type. Neither
+        // that table nor `UserDefinedStruct` itself is parametrized by `A` -- the struct
+        // system was never allocator-aware to begin with, just untouched by this work -- so
+        // the fix isn't to reimplement it, just to bridge across it: reconstruct
+        // `make-struct-type`'s own (small, symbol/int/string) arguments concretely, call the
+        // unmodified original, and convert its result (a list of closures plus a type
+        // descriptor) back into `SteelValGeneric<A>` the same way any other constant-pool
+        // value is -- see `constant_to_generic`.
+        let mut concrete_args: Vec<SteelVal> = Vec::with_capacity(args.len());
+
+        for arg in args.iter() {
+            let converted = match arg {
+                SteelValGeneric::SymbolV(s) => SteelVal::SymbolV(SteelString::from(s.as_str())),
+                SteelValGeneric::StringV(s) => SteelVal::StringV(SteelString::from(s.as_str())),
+                SteelValGeneric::IntV(n) => SteelVal::IntV(*n),
+                SteelValGeneric::BoolV(b) => SteelVal::BoolV(*b),
+                SteelValGeneric::Void => SteelVal::Void,
+                other => match as_concrete_value(other.clone()) {
+                    Some(v) => v,
+                    None => {
+                        return Some(Err(SteelErr::new(
+                            ErrorKind::TypeMismatch,
+                            format!(
+                                "make-struct-type: argument not supported under a custom allocator: {other}"
+                            ),
+                        )))
+                    }
+                },
+            };
+
+            concrete_args.push(converted);
+        }
+
+        Some(
+            crate::values::structs::make_struct_type(&concrete_args)
+                .and_then(|v| constant_to_generic(&v, alloc)),
+        )
     } else {
         None
     }
@@ -3950,7 +4053,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
                             Ok(())
                         }
                         MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
-                        BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+                        BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
                         Closure(closure) => {
                             self.new_handle_tail_call_closure(closure, payload_size)
                         }
@@ -4025,7 +4128,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
                             Ok(())
                         }
                         MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
-                        BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+                        BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
                         Closure(closure) => {
                             self.new_handle_tail_call_closure(closure, payload_size)
                         }
@@ -5287,7 +5390,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
         match stack_func {
             FuncV(f) => self.call_primitive_func(f, payload_size),
             MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
-            BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+            BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
             Closure(closure) => self.new_handle_tail_call_closure(closure, payload_size),
             BuiltIn(f) => self.call_builtin_func(f, payload_size),
             CustomStruct(s) => self.call_custom_struct(&s, payload_size),
@@ -5304,24 +5407,41 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
     }
 
     // #[inline(always)]
-    fn call_boxed_func(
-        &mut self,
-        func: &(dyn Fn(&[SteelVal]) -> Result<SteelVal> + Send + Sync + 'static),
-        payload_size: usize,
-    ) -> Result<()> {
+    fn call_boxed_func(&mut self, f: &Gc<BoxedDynFunction>, payload_size: usize) -> Result<()> {
         let last_index = self.thread.stack.len() - payload_size;
+        let alloc = self.thread.alloc.clone();
 
+        if let Some(result) =
+            dispatch_struct_boxed_function(f, &self.thread.stack[last_index..], &alloc)
+        {
+            let result = result.map_err(|x| x.set_span_if_none(self.current_span()))?;
+            self.thread.stack.truncate(last_index);
+            self.thread.stack.push(result);
+            self.ip += 1;
+            return Ok(());
+        }
+
+        let func = f.func();
+
+        // `as_concrete_slice` is a zero-clone reinterpret when `A == Global`; otherwise
+        // fall back to converting each argument individually via `generic_to_concrete`.
         let result = self
             .thread
-            .enter_safepoint(|ctx| match as_concrete_slice(&ctx.stack[last_index..]) {
-                Some(args) => func(args),
-                None => {
-                    stop!(Generic => "cannot call this native function under a custom allocator")
+            .enter_safepoint(|ctx| {
+                let args = &ctx.stack[last_index..];
+                match as_concrete_slice(args) {
+                    Some(args) => func(args),
+                    None => {
+                        let converted = args
+                            .iter()
+                            .map(generic_to_concrete)
+                            .collect::<Result<Vec<_>>>()?;
+                        func(&converted)
+                    }
                 }
             })
+            .and_then(|v| constant_to_generic(&v, &alloc))
             .map_err(|x| x.set_span_if_none(self.current_span()))?;
-
-        let result = as_generic_value(result).unwrap();
 
         // TODO: Drain, and push onto another thread to drop?
         self.thread.stack.truncate(last_index);
@@ -5424,9 +5544,9 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
 
     // @Matt
     // TODO: This should handle tail calls as well!
-    fn call_custom_struct(&mut self, s: &UserDefinedStruct, payload_size: usize) -> Result<()> {
+    fn call_custom_struct(&mut self, s: &UserDefinedStruct<A>, payload_size: usize) -> Result<()> {
         if let Some(procedure) = s.maybe_proc() {
-            let procedure = if let SteelVal::HeapAllocated(h) = procedure {
+            let procedure = if let SteelValGeneric::HeapAllocated(h) = procedure {
                 h.get()
             } else {
                 procedure.clone()
@@ -5434,6 +5554,9 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
 
             match as_concrete_vmcore(self) {
                 Some(concrete_self) => {
+                    // Safety: `as_concrete_vmcore` just proved `A == Global`, so
+                    // `procedure` is already the concrete `SteelVal`.
+                    let procedure = as_concrete_value(procedure).unwrap();
                     concrete_self.handle_global_function_call(procedure, payload_size)
                 }
                 None => {
@@ -5705,7 +5828,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
         match stack_func {
             Closure(closure) => self.handle_function_call_closure_jit(closure, payload_size),
             FuncV(f) => self.call_primitive_func(f, payload_size),
-            BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+            BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
             MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
             FutureFunc(f) => self.call_future_func(f, payload_size),
             ContinuationFunction(cc) => self.call_continuation(cc),
@@ -5729,7 +5852,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
         match stack_func {
             Closure(closure) => self.handle_function_call_closure_jit_no_arity(closure),
             FuncV(f) => self.call_primitive_func(f, payload_size),
-            BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+            BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
             MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
             FutureFunc(f) => self.call_future_func(f, payload_size),
             ContinuationFunction(cc) => self.call_continuation(cc),
@@ -5788,21 +5911,38 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
             }
             BoxedFunction(f) => {
                 let this = &mut *self;
+                let last_index = this.thread.stack.len() - payload_size;
+                let alloc = this.thread.alloc.clone();
+
+                if let Some(result) =
+                    dispatch_struct_boxed_function(&f, &this.thread.stack[last_index..], &alloc)
+                {
+                    let result = result.map_err(|x| x.set_span_if_none(this.current_span()))?;
+                    this.thread.stack.truncate(last_index);
+                    this.ip += 1;
+                    return Ok(Some(result));
+                }
+
                 let func: &(dyn Fn(&[SteelVal]) -> Result<SteelVal> + Send + Sync + 'static) =
                     f.func();
-                let last_index = this.thread.stack.len() - payload_size;
 
                 let result = this
                     .thread
-                    .enter_safepoint(|ctx| match as_concrete_slice(&ctx.stack[last_index..]) {
-                        Some(args) => func(args),
-                        None => {
-                            stop!(Generic => "cannot call this native function under a custom allocator")
+                    .enter_safepoint(|ctx| {
+                        let args = &ctx.stack[last_index..];
+                        match as_concrete_slice(args) {
+                            Some(args) => func(args),
+                            None => {
+                                let converted = args
+                                    .iter()
+                                    .map(generic_to_concrete)
+                                    .collect::<Result<Vec<_>>>()?;
+                                func(&converted)
+                            }
                         }
                     })
+                    .and_then(|v| constant_to_generic(&v, &alloc))
                     .map_err(|x| x.set_span_if_none(this.current_span()))?;
-
-                let result = as_generic_value(result).unwrap();
 
                 // TODO: Drain, and push onto another thread to drop?
                 this.thread.stack.truncate(last_index);
@@ -5920,9 +6060,9 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
             }
             CustomStruct(s) => {
                 let this = &mut *self;
-                let s: &UserDefinedStruct = &s;
+                let s: &UserDefinedStruct<A> = &s;
                 if let Some(procedure) = s.maybe_proc() {
-                    let procedure = if let SteelVal::HeapAllocated(h) = procedure {
+                    let procedure = if let SteelValGeneric::HeapAllocated(h) = procedure {
                         h.get()
                     } else {
                         procedure.clone()
@@ -5930,6 +6070,9 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
 
                     match as_concrete_vmcore(this) {
                         Some(concrete_this) => {
+                            // Safety: `as_concrete_vmcore` just proved `A == Global`, so
+                            // `procedure` is already the concrete `SteelVal`.
+                            let procedure = as_concrete_value(procedure).unwrap();
                             let result = concrete_this
                                 .handle_global_function_call_no_stack(procedure, payload_size)?;
                             Ok(result.map(|v| as_generic_value(v).unwrap()))
@@ -5957,7 +6100,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
             FuncV(f) => self.call_primitive_func(f, payload_size),
             MutFunc(f) => self.call_primitive_mut_func(f, payload_size),
             Closure(closure) => self.handle_function_call_closure(closure, payload_size),
-            BoxedFunction(f) => self.call_boxed_func(f.func(), payload_size),
+            BoxedFunction(f) => self.call_boxed_func(&f, payload_size),
             FutureFunc(f) => self.call_future_func(f, payload_size),
             ContinuationFunction(cc) => self.call_continuation(cc),
             BuiltIn(f) => self.call_builtin_func(f, payload_size),
@@ -8226,6 +8369,27 @@ fn list_ref_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
     )))
 }
 
+fn hm_construct_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    args: &[SteelValGeneric<A>],
+) -> Result<SteelValGeneric<A>> {
+    let mut hm = crate::HashMap::new();
+    let mut arg_iter = args.iter().cloned();
+
+    loop {
+        match (arg_iter.next(), arg_iter.next()) {
+            (Some(key), Some(value)) => {
+                hm.insert(key, value);
+            }
+            (None, None) => break,
+            _ => {
+                stop!(ArityMismatch => "hash map must have a value for every key!");
+            }
+        }
+    }
+
+    Ok(SteelValGeneric::HashMapV(Gc::new(hm).into()))
+}
+
 fn number_equality_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
     left: &mut SteelValGeneric<A>,
     right: &mut SteelValGeneric<A>,
@@ -8608,7 +8772,18 @@ fn constant_to_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
         SteelVal::MutFunc(f) => Ok(SteelValGeneric::MutFunc(*f)),
         SteelVal::BuiltIn(f) => Ok(SteelValGeneric::BuiltIn(*f)),
         SteelVal::BoxedFunction(f) => Ok(SteelValGeneric::BoxedFunction(f.clone())),
-        SteelVal::CustomStruct(s) => Ok(SteelValGeneric::CustomStruct(s.clone())),
+        SteelVal::CustomStruct(s) => {
+            let mut fields =
+                crate::values::functions::captures_with_capacity_in(s.fields.len(), alloc.clone());
+            for field in s.fields.iter() {
+                fields.push(constant_to_generic(field, alloc)?);
+            }
+            let new_struct = crate::values::structs::UserDefinedStruct {
+                fields,
+                type_descriptor: s.type_descriptor,
+            };
+            Ok(SteelValGeneric::CustomStruct(Gc::new_in(new_struct, alloc.clone())))
+        }
         SteelVal::PortV(p) => Ok(SteelValGeneric::PortV(p.clone())),
         SteelVal::Custom(c) => Ok(SteelValGeneric::Custom(c.clone())),
         // Bytecode is allocator-independent (a plain shared byte buffer) and can just be
@@ -8672,6 +8847,182 @@ fn constant_to_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
             }
         },
     }
+}
+
+/// The reverse of `constant_to_generic`: reduces a value built under an arbitrary `A` back
+/// down to `Global`-backed content, so it can be handed to a plain `Fn(&[SteelVal]) ->
+/// Result<SteelVal>`/`fn(&[SteelVal]) -> ...` native (`BoxedFunction`/`FuncV`/`MutFunc`) --
+/// including struct constructor/predicate/getter closures, which are dynamically created per
+/// `(struct ...)` invocation and so have no static function pointer to recognize via the
+/// `hot_path_*_dispatch` machinery. Only handles the same content `constant_to_generic` can
+/// build; anything else (persistent-collection-adjacent or otherwise not yet generalized)
+/// reports clearly rather than doing anything unsound.
+fn generic_to_concrete<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    val: &SteelValGeneric<A>,
+) -> Result<SteelVal> {
+    if let Some(v) = as_concrete_value(val.clone()) {
+        return Ok(v);
+    }
+
+    match val {
+        SteelValGeneric::Void => Ok(SteelVal::Void),
+        SteelValGeneric::BoolV(b) => Ok(SteelVal::BoolV(*b)),
+        SteelValGeneric::NumV(n) => Ok(SteelVal::NumV(*n)),
+        SteelValGeneric::IntV(n) => Ok(SteelVal::IntV(*n)),
+        SteelValGeneric::Rational(r) => Ok(SteelVal::Rational(*r)),
+        SteelValGeneric::CharV(c) => Ok(SteelVal::CharV(*c)),
+        SteelValGeneric::BigNum(b) => Ok(SteelVal::BigNum(b.clone())),
+        SteelValGeneric::BigRational(b) => Ok(SteelVal::BigRational(b.clone())),
+        SteelValGeneric::Complex(c) => Ok(SteelVal::Complex(c.clone())),
+        SteelValGeneric::ByteVector(b) => Ok(SteelVal::ByteVector(b.clone())),
+        SteelValGeneric::FuncV(f) => Ok(SteelVal::FuncV(*f)),
+        SteelValGeneric::MutFunc(f) => Ok(SteelVal::MutFunc(*f)),
+        SteelValGeneric::BuiltIn(f) => Ok(SteelVal::BuiltIn(*f)),
+        SteelValGeneric::BoxedFunction(f) => Ok(SteelVal::BoxedFunction(f.clone())),
+        SteelValGeneric::CustomStruct(s) => {
+            let mut fields = crate::values::functions::empty_captures_in(crate::gc::Global);
+            for field in s.fields.iter() {
+                fields.push(generic_to_concrete(field)?);
+            }
+            let new_struct = crate::values::structs::UserDefinedStruct {
+                fields,
+                type_descriptor: s.type_descriptor,
+            };
+            Ok(SteelVal::CustomStruct(Gc::new(new_struct)))
+        }
+        SteelValGeneric::PortV(p) => Ok(SteelVal::PortV(p.clone())),
+        SteelValGeneric::Custom(c) => Ok(SteelVal::Custom(c.clone())),
+        SteelValGeneric::StringV(s) => Ok(SteelVal::StringV(SteelString::from(s.as_str()))),
+        SteelValGeneric::SymbolV(s) => Ok(SteelVal::SymbolV(SteelString::from(s.as_str()))),
+        SteelValGeneric::ListV(l) => {
+            let items = l
+                .iter()
+                .map(generic_to_concrete)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SteelVal::ListV(items.into()))
+        }
+        SteelValGeneric::VectorV(v) => {
+            let items = v
+                .iter()
+                .map(generic_to_concrete)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SteelVal::VectorV(items.into_iter().collect()))
+        }
+        SteelValGeneric::HashMapV(m) => {
+            let mut result = crate::HashMap::new();
+            for (k, v) in m.iter() {
+                result.insert(generic_to_concrete(k)?, generic_to_concrete(v)?);
+            }
+            Ok(SteelVal::HashMapV(Gc::new(result).into()))
+        }
+        SteelValGeneric::HashSetV(s) => {
+            let mut result = crate::HashSet::new();
+            for v in s.iter() {
+                result.insert(generic_to_concrete(v)?);
+            }
+            Ok(SteelVal::HashSetV(Gc::new(result).into()))
+        }
+        SteelValGeneric::Pair(p) => {
+            let pair = crate::values::lists::Pair::cons(
+                generic_to_concrete(p.car_ref())?,
+                generic_to_concrete(p.cdr_ref())?,
+            );
+            Ok(SteelVal::Pair(Gc::new(pair)))
+        }
+        other => {
+            stop!(Generic => format!("argument of this type is not supported under a custom allocator: {:?}", other))
+        }
+    }
+}
+
+/// Recognizes a `BoxedFunction` as one of the four struct accessor closures
+/// (`UserDefinedStruct::constructor`/`predicate`/`getter_prototype`/`getter_prototype_index`
+/// in values/structs.rs) and, if so, reimplements that specific operation directly against
+/// `SteelValGeneric<A>` -- rather than routing through `generic_to_concrete`/
+/// `constant_to_generic`, which would flatten a struct's fields down to `Global` and back.
+/// That flattening is actively wrong for a `#:mutable` struct: `kernel.scm`'s `struct-impl`
+/// wraps every mutable field in `(#%box ...)` at construction time, so a field can hold a
+/// `HeapAllocated` box built through the caller's own allocator `A` -- flattening it to
+/// `Global` would silently disconnect later `unbox`/`set-box!` calls from the original box.
+///
+/// These closures are created fresh (a new `Arc::new(f)`) every time `(struct ...)` runs, so
+/// there's no static function pointer to recognize the way `hot_path_*_dispatch` does for the
+/// rest of the standard library -- `create_struct_spec` instead recognizes them by identity
+/// against the process-wide `STRUCT_MAP` registry (see values/structs.rs). That registry, and
+/// the `SteelVal::BoxedFunction` wrapper used to query it, are both `Global`-only, but that's
+/// just a lookup key -- the actual field data handled below is fully generic over `A`.
+fn dispatch_struct_boxed_function<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    f: &Gc<BoxedDynFunction>,
+    args: &[SteelValGeneric<A>],
+    alloc: &A,
+) -> Option<Result<SteelValGeneric<A>>> {
+    let spec = crate::values::structs::create_struct_spec(SteelVal::BoxedFunction(f.clone()))?;
+
+    Some((|| -> Result<SteelValGeneric<A>> {
+        match spec.typ {
+            crate::values::structs::StructFunctionType::Constructor => {
+                let mut fields =
+                    crate::values::functions::captures_with_capacity_in(args.len(), alloc.clone());
+                fields.extend(args.iter().cloned());
+                let new_struct = crate::values::structs::UserDefinedStruct {
+                    fields,
+                    type_descriptor: spec.descriptor,
+                };
+                Ok(SteelValGeneric::CustomStruct(Gc::new_in(new_struct, alloc.clone())))
+            }
+            crate::values::structs::StructFunctionType::Predicate => {
+                let Some(arg) = args.first() else {
+                    stop!(ArityMismatch => "struct predicate expected one argument, found: {}", args.len());
+                };
+
+                Ok(SteelValGeneric::BoolV(matches!(
+                    arg,
+                    SteelValGeneric::CustomStruct(s) if s.type_descriptor == spec.descriptor
+                )))
+            }
+            crate::values::structs::StructFunctionType::GetterProto => {
+                let (Some(steel_struct), Some(idx)) = (args.first(), args.get(1)) else {
+                    stop!(ArityMismatch => "struct accessor expected two arguments, found: {}", args.len());
+                };
+
+                match (steel_struct, idx) {
+                    (SteelValGeneric::CustomStruct(s), SteelValGeneric::IntV(idx)) => {
+                        if s.type_descriptor != spec.descriptor {
+                            stop!(TypeMismatch => format!("struct getter expected a different struct type, found: {steel_struct:?}"));
+                        }
+                        if *idx < 0 {
+                            stop!(Generic => "struct-ref expected a non negative index");
+                        }
+                        s.fields.get(*idx as usize).cloned().ok_or_else(
+                            throw!(Generic => "struct-ref: {} - index out of bounds: {}", s.name(), idx),
+                        )
+                    }
+                    _ => {
+                        stop!(TypeMismatch => format!("struct accessor expected a struct and an int, found: {steel_struct:?} and {idx:?}"))
+                    }
+                }
+            }
+            crate::values::structs::StructFunctionType::GetterProtoVec(index) => {
+                let Some(steel_struct) = args.first() else {
+                    stop!(ArityMismatch => "struct-ref expected one argument");
+                };
+
+                match steel_struct {
+                    SteelValGeneric::CustomStruct(s) => {
+                        if s.type_descriptor != spec.descriptor {
+                            stop!(TypeMismatch => format!("struct getter expected a different struct type, found: {steel_struct:?}"));
+                        }
+                        s.fields.get(index).cloned().ok_or_else(
+                            throw!(Generic => "struct-ref: {} - index out of bounds: {}", s.name(), index),
+                        )
+                    }
+                    _ => {
+                        stop!(TypeMismatch => format!("struct accessor expected a struct, found: {steel_struct:?}"))
+                    }
+                }
+            }
+        }
+    })())
 }
 
 // OpCode::ADD

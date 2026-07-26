@@ -99,19 +99,20 @@ const SCRIPT: &str = r#"
     (define history (box '()))
     (define event-count (box 0))
 
-    ;; Global app state. `state` starts unset; `init` sets it up -- call it
-    ;; once, on the real-time engine, before feeding it any events. Kept
-    ;; as a plain box rather than a `(struct ...)`: struct's generated
-    ;; constructor currently goes through a Global-only built-in, which
-    ;; isn't supported yet under a custom allocator.
+    ;; Global app state, kept in its own mutable struct. `state` starts unset;
+    ;; `init` creates the actual instance -- call it once, on the
+    ;; real-time engine, before feeding it any events.
+    (struct AppState (is-shift-pressed) #:mutable)
+
     (define state (box #f))
 
     (define (init)
-      (set-box! state #f)) ;; is-shift-pressed = #f
+      (set-box! state (AppState #f)))
 
-    (define (is-shift-pressed?) (unbox state))
+    (define (is-shift-pressed?) (AppState-is-shift-pressed (unbox state)))
 
-    (define (set-shift-pressed! pressed) (set-box! state pressed))
+    (define (set-shift-pressed! pressed)
+      (set-AppState-is-shift-pressed! (unbox state) pressed))
 
     (define (clamp value low high)
       (if (<= value low)
@@ -166,6 +167,17 @@ fn main() -> steel::rvals::Result<()> {
     realtime_engine.call_function_by_name_with_args("init", vec![])?;
 
     println!("bytes allocated after setup: {}", bump.bytes_used());
+
+    let shift_pressed = realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
+    println!("is-shift-pressed? => {shift_pressed}");
+
+    realtime_engine.call_function_by_name_with_args(
+        "set-shift-pressed!",
+        vec![SteelValGeneric::BoolV(true)],
+    )?;
+
+    let shift_pressed = realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
+    println!("is-shift-pressed? (after set-shift-pressed! #t) => {shift_pressed}");
 
     // Simulate a small stream of MIDI messages arriving on the "audio thread". Each call
     // allocates only through `bump`: the two integer arguments are plain `IntV`s (no
