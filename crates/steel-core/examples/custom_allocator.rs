@@ -96,23 +96,23 @@ unsafe impl Allocator for BumpAllocator {
 }
 
 const SCRIPT: &str = r#"
-    (define history (box '()))
-    (define event-count (box 0))
+    (define history '())
+    (define event-count 0)
 
     ;; Global app state, kept in its own mutable struct. `state` starts unset;
     ;; `init` creates the actual instance -- call it once, on the
     ;; real-time engine, before feeding it any events.
     (struct AppState (is-shift-pressed) #:mutable)
 
-    (define state (box #f))
+    (define state #f)
 
     (define (init)
-      (set-box! state (AppState #f)))
+      (set! state (AppState #f)))
 
-    (define (is-shift-pressed?) (AppState-is-shift-pressed (unbox state)))
+    (define (is-shift-pressed?) (AppState-is-shift-pressed state))
 
     (define (set-shift-pressed! pressed)
-      (set-AppState-is-shift-pressed! (unbox state) pressed))
+      (set-AppState-is-shift-pressed! state pressed))
 
     (define (clamp value low high)
       (if (<= value low)
@@ -124,16 +124,16 @@ const SCRIPT: &str = r#"
     ;; A toy "MIDI mapping": note-on messages (status 144) add the two data
     ;; bytes together and clamp to the MIDI range; anything else subtracts
     ;; them. Every call records the incoming velocity into `history` and
-    ;; bumps a running counter, both via boxes -- mutated captured state,
-    ;; exactly like a real mapping script would keep around.
+    ;; bumps a running counter -- mutated top-level state, exactly like a
+    ;; real mapping script would keep around.
     (define (on-midi-in status data1 data2)
-      (set-box! history (cons data2 (unbox history)))
-      (set-box! event-count (+ 1 (unbox event-count)))
+      (set! history (cons data2 history))
+      (set! event-count (+ 1 event-count))
       (if (= status 144)
           (clamp (+ data1 data2) 0 127)
           (clamp (- data1 data2) 0 127)))
 
-    (define (get-event-count) (unbox event-count))
+    (define (get-event-count) event-count)
 "#;
 
 fn main() -> steel::rvals::Result<()> {
@@ -158,8 +158,8 @@ fn main() -> steel::rvals::Result<()> {
     let mut realtime_engine = compiler_engine.new_engine_with_allocator(bump.clone())?;
 
     // Run the compiled bytecode inside the new engine: this is where `on-midi-in`, `history`,
-    // and every closure/box/cons cell it needs get constructed for the first time, all
-    // through `bump` rather than the global allocator.
+    // and every closure it needs get constructed for the first time, all through `bump`
+    // rather than the global allocator.
     realtime_engine.run_executable(&executable)?;
 
     // Now that `init` is defined (as a global in `realtime_engine`'s own environment), call it
