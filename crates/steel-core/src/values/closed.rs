@@ -2463,46 +2463,16 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> MarkAndSweepCo
     }
 }
 
-// Not derived: `derive(Default/Debug)` would add an `A: Default`/`A: Debug` bound even
-// though `Vec<SteelValGeneric<A>>` doesn't actually need either (a plain `Vec`'s `Default`
-// doesn't require its element type to be `Default`) -- same reasoning as `Gc<T, A>`.
+// `keep_alive` stays out of the `Debug` output -- it can hold an unbounded number of
+// kept-alive values.
+#[derive(educe::Educe)]
+#[educe(Default, Clone, Debug)]
 struct MarkAndSweepStats<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     object_count: usize,
     memory_reached_count: usize,
     vector_reached_count: usize,
+    #[educe(Debug(ignore))]
     keep_alive: Vec<SteelValGeneric<A>>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Default for MarkAndSweepStats<A> {
-    fn default() -> Self {
-        Self {
-            object_count: 0,
-            memory_reached_count: 0,
-            vector_reached_count: 0,
-            keep_alive: Vec::new(),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for MarkAndSweepStats<A> {
-    fn clone(&self) -> Self {
-        Self {
-            object_count: self.object_count,
-            memory_reached_count: self.memory_reached_count,
-            vector_reached_count: self.vector_reached_count,
-            keep_alive: self.keep_alive.clone(),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for MarkAndSweepStats<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MarkAndSweepStats")
-            .field("object_count", &self.object_count)
-            .field("memory_reached_count", &self.memory_reached_count)
-            .field("vector_reached_count", &self.vector_reached_count)
-            .finish()
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::ops::Add for MarkAndSweepStats<A> {

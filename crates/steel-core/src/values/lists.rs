@@ -13,25 +13,14 @@ use crate::{
 
 // TODO:
 // Builtin immutable pairs
+//
+// `Debug` stays hand-written below: it deliberately prints Scheme's `(car . cdr)` notation
+// instead of a derive-style struct dump.
+#[derive(educe::Educe)]
+#[educe(Clone, Hash)]
 pub struct Pair<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     pub(crate) car: SteelValGeneric<A>,
     pub(crate) cdr: SteelValGeneric<A>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for Pair<A> {
-    fn clone(&self) -> Self {
-        Pair {
-            car: self.car.clone(),
-            cdr: self.cdr.clone(),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for Pair<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.car.hash(state);
-        self.cdr.hash(state);
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Pair<A> {

@@ -2,20 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::rvals::{SerializableSteelVal, SteelVal, SteelValGeneric};
 
+#[derive(educe::Educe)]
+#[educe(Clone)]
 pub struct LazyStream<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     pub initial_value: SteelValGeneric<A>, // argument to stream
     pub stream_thunk: SteelValGeneric<A>,  // function to get the next value
     pub empty_stream: bool,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for LazyStream<A> {
-    fn clone(&self) -> Self {
-        LazyStream {
-            initial_value: self.initial_value.clone(),
-            stream_thunk: self.stream_thunk.clone(),
-            empty_stream: self.empty_stream,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

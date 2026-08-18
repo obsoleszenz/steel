@@ -164,29 +164,23 @@ impl DehydratedStackTrace {
 //     Transducer,
 // }
 
-#[derive(Clone)]
+#[derive(Clone, educe::Educe)]
+#[educe(Debug)]
 pub struct StackFrameAttachments<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     pub(crate) handler: Option<SteelValGeneric<A>>,
     weak_continuation_mark: Option<WeakContinuation>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for StackFrameAttachments<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StackFrameAttachments")
-            .field("handler", &self.handler)
-            .field("weak_continuation_mark", &self.weak_continuation_mark)
-            .finish()
-    }
 }
 
 // This should be the go to thing for handling basically everything we need
 // Then - do I want to always reference the last one, or just refer to the current one?
 // TODO: We'll need to add these functions to the GC as well
 
-#[derive(Clone)]
+#[derive(Clone, educe::Educe)]
+#[educe(Debug)]
 pub struct StackFrame<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     sp: u32,
 
+    #[educe(Debug(ignore))]
     pub(crate) function: crate::values::functions::ByteCodeLambdaGc<A>,
 
     ip: u32,
@@ -194,17 +188,6 @@ pub struct StackFrame<A: crate::gc::Allocator + Clone + Send + Sync + 'static = 
     instructions: RootedInstructions,
 
     pub(crate) attachments: Option<Box<StackFrameAttachments<A>>>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for StackFrame::<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StackFrame")
-            .field("sp", &self.sp)
-            .field("ip", &self.ip)
-            .field("instructions", &self.instructions)
-            .field("attachments", &self.attachments)
-            .finish()
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Eq for StackFrame::<A> {}
@@ -488,7 +471,8 @@ impl RunTimeOptions {
 }
 
 // TODO: This object probably needs to be shared as well
-#[derive(Clone)]
+#[derive(Clone, educe::Educe)]
+#[educe(Default)]
 pub struct FunctionInterner<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     closure_interner: rustc_hash::FxHashMap<u32, ByteCodeLambda<A>>,
     pub(crate) pure_function_interner:
@@ -507,20 +491,6 @@ pub struct FunctionInterner<A: crate::gc::Allocator + Clone + Send + Sync + 'sta
 
     #[cfg(feature = "jit2")]
     jit_funcs: rustc_hash::FxHashMap<u32, crate::values::functions::ByteCodeLambdaGc<A>>,
-}
-
-// Not derived: `derive(Default)` would add an `A: Default` bound even though
-// `FxHashMap`'s `Default` doesn't need its key/value types to be `Default`.
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Default for FunctionInterner<A> {
-    fn default() -> Self {
-        Self {
-            closure_interner: Default::default(),
-            pure_function_interner: Default::default(),
-            spans: Default::default(),
-            #[cfg(feature = "jit2")]
-            jit_funcs: Default::default(),
-        }
-    }
 }
 
 #[derive(Clone, Default)]

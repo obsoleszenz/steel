@@ -240,58 +240,54 @@ pub type ByteCodeLambdaGc<A> = Gc<ByteCodeLambda<A>, A>;
 )))]
 pub type ByteCodeLambdaGc<A> = Gc<ByteCodeLambda<A>>;
 
-#[derive(Clone)]
+#[derive(Clone, educe::Educe)]
+#[educe(Debug)]
 pub struct ByteCodeLambda<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     pub(crate) id: u32,
     /// body of the function with identifiers yet to be bound
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     pub(crate) body_exp: RefCell<Shared<[DenseInstruction]>>,
 
     #[cfg(not(feature = "dynamic"))]
+    #[educe(Debug(ignore))]
     pub(crate) body_exp: StandardShared<[DenseInstruction]>,
 
     pub(crate) arity: u16,
 
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     call_count: Cell<usize>,
 
     pub(crate) is_multi_arity: bool,
 
     // Store... some amount inline?
     // pub(crate) captures: Vec<SteelVal>,
+    #[educe(Debug(ignore))]
     pub(crate) captures: CaptureVec<A>,
 
     // pub(crate) captures: Box<[SteelVal]>
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     pub(crate) blocks: RefCell<Vec<(BlockPattern, BlockMetadata)>>,
 
     // This is a little suspicious, but it should give us the necessary information to attach a struct of metadata
     #[cfg(feature = "sync")]
+    #[educe(Debug(ignore))]
     contract: SharedMut<Option<Gc<UserDefinedStruct>>>,
 
     #[cfg(not(feature = "sync"))]
+    #[educe(Debug(ignore))]
     contract: MutContainer<Option<Gc<UserDefinedStruct>>>,
 
     #[cfg(feature = "jit2")]
+    #[educe(Debug(ignore))]
     pub(crate) super_instructions: Option<fn(&mut crate::steel_vm::vm::VmCore)>,
 
     // In the event this is serialized and its been jit compiled, replace
     // the first instruction with this, since this is what is was originally
+    #[educe(Debug(ignore))]
     pub(crate) header: Option<OpCode>,
-}
-
-// Not derived: a derived `Debug` would add an `A: Debug` bound to the whole impl even
-// though only `id`/`arity`/`is_multi_arity` are actually printed -- `Global` happens to be
-// `Debug`, but a real custom allocator (an arena, a ring buffer, ...) generally isn't, and
-// there's no reason to require it just to print a closure.
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for ByteCodeLambda<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ByteCodeLambda")
-            .field("id", &self.id)
-            .field("arity", &self.arity)
-            .field("is_multi_arity", &self.is_multi_arity)
-            .finish()
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for ByteCodeLambda<A> {

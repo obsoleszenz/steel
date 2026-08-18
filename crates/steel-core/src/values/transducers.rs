@@ -8,27 +8,11 @@ type Alloc = crate::gc::Global;
 
 // Make a transducer actually contain an option to a rooted value, otherwise
 // it is a source agnostic transformer on the (eventual) input
+#[derive(educe::Educe)]
+#[educe(Clone, PartialEq, Hash, Default)]
 pub struct Transducer<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     // root: Gc<SteelVal>,
     pub ops: Vec<Transducers<A>>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for Transducer<A> {
-    fn clone(&self) -> Self {
-        Transducer {
-            ops: self.ops.clone(),
-        }
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for Transducer<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self.ops == other.ops
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for Transducer<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.ops.hash(state);
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Transducer<A> {
@@ -45,12 +29,8 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Transducer<A> {
     }
 }
 
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Default for Transducer<A> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[derive(educe::Educe)]
+#[educe(Clone, PartialEq, Hash)]
 pub enum Transducers<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     Map(SteelValGeneric<A>),          // function
     Filter(SteelValGeneric<A>),       // function
@@ -72,107 +52,14 @@ pub enum Transducers<A: crate::gc::Allocator + Clone + Send + Sync + 'static = A
     MapPair(SteelValGeneric<A>),
 }
 
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for Transducers<A> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Map(v) => Self::Map(v.clone()),
-            Self::Filter(v) => Self::Filter(v.clone()),
-            Self::Take(v) => Self::Take(v.clone()),
-            Self::Drop(v) => Self::Drop(v.clone()),
-            Self::FlatMap(v) => Self::FlatMap(v.clone()),
-            Self::Flatten => Self::Flatten,
-            Self::Window(v) => Self::Window(v.clone()),
-            Self::TakeWhile(v) => Self::TakeWhile(v.clone()),
-            Self::DropWhile(v) => Self::DropWhile(v.clone()),
-            Self::Extend(v) => Self::Extend(v.clone()),
-            Self::Cycle => Self::Cycle,
-            Self::Enumerating => Self::Enumerating,
-            Self::Zipping(v) => Self::Zipping(v.clone()),
-            Self::Interleaving(v) => Self::Interleaving(v.clone()),
-            Self::MapPair(v) => Self::MapPair(v.clone()),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for Transducers<A> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Map(a), Self::Map(b)) => a == b,
-            (Self::Filter(a), Self::Filter(b)) => a == b,
-            (Self::Take(a), Self::Take(b)) => a == b,
-            (Self::Drop(a), Self::Drop(b)) => a == b,
-            (Self::FlatMap(a), Self::FlatMap(b)) => a == b,
-            (Self::Flatten, Self::Flatten) => true,
-            (Self::Window(a), Self::Window(b)) => a == b,
-            (Self::TakeWhile(a), Self::TakeWhile(b)) => a == b,
-            (Self::DropWhile(a), Self::DropWhile(b)) => a == b,
-            (Self::Extend(a), Self::Extend(b)) => a == b,
-            (Self::Cycle, Self::Cycle) => true,
-            (Self::Enumerating, Self::Enumerating) => true,
-            (Self::Zipping(a), Self::Zipping(b)) => a == b,
-            (Self::Interleaving(a), Self::Interleaving(b)) => a == b,
-            (Self::MapPair(a), Self::MapPair(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for Transducers<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        core::mem::discriminant(self).hash(state);
-        match self {
-            Self::Map(v)
-            | Self::Filter(v)
-            | Self::Take(v)
-            | Self::Drop(v)
-            | Self::FlatMap(v)
-            | Self::Window(v)
-            | Self::TakeWhile(v)
-            | Self::DropWhile(v)
-            | Self::Extend(v)
-            | Self::Zipping(v)
-            | Self::Interleaving(v)
-            | Self::MapPair(v) => v.hash(state),
-            Self::Flatten | Self::Cycle | Self::Enumerating => {}
-        }
-    }
-}
-
 // This should just describe how a sequence of values can be reduced
 // assert that the function passed in has an arity of 2
 // and the initival
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReducerFunc<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     pub(crate) initial_value: SteelValGeneric<A>,
     pub(crate) function: SteelValGeneric<A>,
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for ReducerFunc<A> {
-    fn clone(&self) -> Self {
-        ReducerFunc {
-            initial_value: self.initial_value.clone(),
-            function: self.function.clone(),
-        }
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for ReducerFunc<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ReducerFunc")
-            .field("initial_value", &self.initial_value)
-            .field("function", &self.function)
-            .finish()
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for ReducerFunc<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self.initial_value == other.initial_value && self.function == other.function
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Eq for ReducerFunc<A> {}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for ReducerFunc<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.initial_value.hash(state);
-        self.function.hash(state);
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> ReducerFunc<A> {
@@ -186,7 +73,8 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> ReducerFunc<A> {
 
 // Defines how to collect a function
 // defaults to the same input type?
-
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Reducer<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     // Sum the sequence
     Sum,
@@ -216,83 +104,6 @@ pub enum Reducer<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc
     ForEach(SteelValGeneric<A>),
     // Collect according to the function
     Generic(ReducerFunc<A>),
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for Reducer<A> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Sum => Self::Sum,
-            Self::Multiply => Self::Multiply,
-            Self::Max => Self::Max,
-            Self::Min => Self::Min,
-            Self::Count => Self::Count,
-            Self::Nth(n) => Self::Nth(*n),
-            Self::List => Self::List,
-            Self::Vector => Self::Vector,
-            Self::HashMap => Self::HashMap,
-            Self::HashSet => Self::HashSet,
-            Self::String => Self::String,
-            Self::Last => Self::Last,
-            Self::ForEach(v) => Self::ForEach(v.clone()),
-            Self::Generic(rf) => Self::Generic(rf.clone()),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for Reducer<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Sum => write!(f, "Sum"),
-            Self::Multiply => write!(f, "Multiply"),
-            Self::Max => write!(f, "Max"),
-            Self::Min => write!(f, "Min"),
-            Self::Count => write!(f, "Count"),
-            Self::Nth(n) => write!(f, "Nth({n})"),
-            Self::List => write!(f, "List"),
-            Self::Vector => write!(f, "Vector"),
-            Self::HashMap => write!(f, "HashMap"),
-            Self::HashSet => write!(f, "HashSet"),
-            Self::String => write!(f, "String"),
-            Self::Last => write!(f, "Last"),
-            Self::ForEach(v) => write!(f, "ForEach({v:?})"),
-            Self::Generic(rf) => write!(f, "Generic({rf:?})"),
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for Reducer<A> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Sum, Self::Sum)
-            | (Self::Multiply, Self::Multiply)
-            | (Self::Max, Self::Max)
-            | (Self::Min, Self::Min)
-            | (Self::Count, Self::Count)
-            | (Self::List, Self::List)
-            | (Self::Vector, Self::Vector)
-            | (Self::HashMap, Self::HashMap)
-            | (Self::HashSet, Self::HashSet)
-            | (Self::String, Self::String)
-            | (Self::Last, Self::Last) => true,
-            (Self::Nth(a), Self::Nth(b)) => a == b,
-            (Self::ForEach(a), Self::ForEach(b)) => a == b,
-            (Self::Generic(a), Self::Generic(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Eq for Reducer<A> {}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for Reducer<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        core::mem::discriminant(self).hash(state);
-        match self {
-            Self::Nth(n) => n.hash(state),
-            Self::ForEach(v) => v.hash(state),
-            Self::Generic(rf) => rf.hash(state),
-            _ => {}
-        }
-    }
 }
 
 macro_rules! into_collection {

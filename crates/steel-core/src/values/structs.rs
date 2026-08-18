@@ -28,8 +28,6 @@ use crate::{
 };
 use crate::{steel_vm::builtin::BuiltInModule, stop};
 use alloc::sync::Arc;
-use core::hash::Hash;
-use core::ops::Deref;
 use std::collections::{HashSet, VecDeque};
 use std::{
     cell::{Ref, RefCell},
@@ -179,35 +177,15 @@ pub type UserDefinedStructGc<A> = Gc<UserDefinedStruct<A>>;
 /// ...)`) -- can hold content actually built through the caller's own allocator, instead of
 /// forcing every struct field down to `Global` regardless of what allocator constructed the
 /// struct itself.
+// TODO: PartialEq/Hash could blow the stack for big trees...
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Hash)]
 pub struct UserDefinedStruct<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global>
 {
     pub(crate) fields: crate::values::functions::CaptureVec<A>,
 
     // Type Descriptor. Use this as an index into the VTable to find anything that we need.
     pub(crate) type_descriptor: StructTypeDescriptor,
-}
-
-// Not derived: a derived `Debug`/`Clone` would add an `A: Debug`/`A: Clone` bound to the
-// whole impl even though `A` only shows up inside `fields`' element type -- `Global` happens
-// to satisfy both, but a real custom allocator generally only needs to satisfy `Clone` (which
-// the trait bound on `A` already guarantees), not `Debug`. Same reasoning as
-// `ByteCodeLambda<A>`'s manual `Debug` impl.
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Clone for UserDefinedStruct<A> {
-    fn clone(&self) -> Self {
-        Self {
-            fields: self.fields.clone(),
-            type_descriptor: self.type_descriptor,
-        }
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for UserDefinedStruct<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("UserDefinedStruct")
-            .field("fields", &self.fields.iter().collect::<Vec<_>>())
-            .field("type_descriptor", &self.type_descriptor)
-            .finish()
-    }
 }
 
 impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> UserDefinedStruct<A> {
@@ -244,20 +222,6 @@ impl UserDefinedStruct<crate::gc::Global> {
         if let Some(SteelVal::HeapAllocated(s)) = inner {
             s.set_and_return(value);
         }
-    }
-}
-
-// TODO: This could blow the stack for big trees...
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for UserDefinedStruct<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_descriptor == other.type_descriptor && self.fields.deref() == other.fields.deref()
-    }
-}
-
-impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Hash for UserDefinedStruct<A> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.type_descriptor.hash(state);
-        self.fields.deref().hash(state);
     }
 }
 
