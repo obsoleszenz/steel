@@ -1,36 +1,15 @@
 use crate::gc::{Allocator, Global};
 use crate::rvals::Result;
-#[cfg(all(
-    feature = "sync",
-    feature = "biased",
-    feature = "allocator-api2",
-    not(feature = "triomphe")
-))]
 use crate::rvals::SteelValGeneric;
-#[cfg(not(all(
-    feature = "sync",
-    feature = "biased",
-    feature = "allocator-api2",
-    not(feature = "triomphe")
-)))]
-use crate::rvals::SteelVal;
-#[cfg(all(
-    feature = "sync",
-    not(all(
-        feature = "biased",
-        feature = "allocator-api2",
-        not(feature = "triomphe")
-    ))
-))]
-use once_cell::sync::Lazy;
 use shared_vector::AtomicSharedVector;
 
 // `Env`'s global bindings storage is cfg-split the same way `Gc<T>`/`Gc<T, A>` is (see
 // gc.rs): the `sync+biased+allocator-api2` combo is the only one where a `Gc<T, A>` with a
-// non-`Global` `A` actually exists, so it's the only one where routing the bindings buffer
-// itself through `A` means anything. Every other feature combo keeps the original storage,
-// with `A` carried only as a `PhantomData` marker so `SteelThread`'s (eventual) `Env<A>`
-// field can name a single type in every world.
+// non-`Global` `A` actually exists, so it's the only one where the bindings buffer's own
+// backing memory is routed through `A` (`AtomicSharedVector<SteelValGeneric<A>, A>`). Every
+// other combo still stores `SteelValGeneric<A>` as the element type -- just backed by
+// `shared_vector`'s own default allocator, since routing the buffer itself through `A` needs
+// `allocator-api2` specifically.
 #[cfg(all(
     feature = "sync",
     feature = "biased",
@@ -129,8 +108,11 @@ unsafe impl<A: Allocator + Clone + Send + Sync + 'static> Sync for SharedVectorW
     feature = "allocator-api2",
     not(feature = "triomphe")
 )))]
-#[derive(Debug, Clone)]
-pub(crate) struct SharedVectorWrapper(pub AtomicSharedVector<SteelVal>);
+#[derive(educe::Educe)]
+#[educe(Debug, Clone)]
+pub(crate) struct SharedVectorWrapper<A: Allocator + Clone + Send + Sync + 'static = Global>(
+    pub AtomicSharedVector<SteelValGeneric<A>>,
+);
 
 #[cfg(not(all(
     feature = "sync",
@@ -138,15 +120,15 @@ pub(crate) struct SharedVectorWrapper(pub AtomicSharedVector<SteelVal>);
     feature = "allocator-api2",
     not(feature = "triomphe")
 )))]
-impl SharedVectorWrapper {
-    pub fn set_idx(&mut self, idx: usize, val: SteelVal) -> SteelVal {
+impl<A: Allocator + Clone + Send + Sync + 'static> SharedVectorWrapper<A> {
+    pub fn set_idx(&mut self, idx: usize, val: SteelValGeneric<A>) -> SteelValGeneric<A> {
         let guard = self.0.get_mut(idx).unwrap();
         let output = guard.clone();
         *guard = val;
         output
     }
 
-    pub fn repl_define_idx(&mut self, idx: usize, val: SteelVal) {
+    pub fn repl_define_idx(&mut self, idx: usize, val: SteelValGeneric<A>) {
         let guard = &mut self.0;
         if idx < guard.len() {
             guard[idx] = val.clone();
@@ -160,7 +142,7 @@ impl SharedVectorWrapper {
                 // assuming that the values then get actually updated
                 // to the correct values.
                 for _ in 0..(idx - guard.len()) {
-                    guard.push(SteelVal::Void);
+                    guard.push(SteelValGeneric::Void);
                 }
             }
 
@@ -175,122 +157,21 @@ impl SharedVectorWrapper {
     feature = "allocator-api2",
     not(feature = "triomphe")
 )))]
-unsafe impl Sync for SharedVectorWrapper {}
+unsafe impl<A: Allocator + Clone + Send + Sync + 'static> Sync for SharedVectorWrapper<A> {}
 
-#[allow(unused)]
+#[derive(educe::Educe)]
+#[educe(Debug, Clone)]
 pub struct Env<A: Allocator + Clone + Send + Sync + 'static = Global> {
     #[cfg(not(feature = "sync"))]
-    pub(crate) bindings_vec: Vec<SteelVal>,
-    #[cfg(not(feature = "sync"))]
-    _marker: core::marker::PhantomData<A>,
+    pub(crate) bindings_vec: Vec<SteelValGeneric<A>>,
 
-    #[cfg(all(
-        feature = "sync",
-        feature = "biased",
-        feature = "allocator-api2",
-        not(feature = "triomphe")
-    ))]
+    #[cfg(feature = "sync")]
     pub(crate) bindings: SharedVectorWrapper<A>,
-
-    #[cfg(all(
-        feature = "sync",
-        not(all(
-            feature = "biased",
-            feature = "allocator-api2",
-            not(feature = "triomphe")
-        ))
-    ))]
-    pub(crate) bindings: SharedVectorWrapper,
-    #[cfg(all(
-        feature = "sync",
-        not(all(
-            feature = "biased",
-            feature = "allocator-api2",
-            not(feature = "triomphe")
-        ))
-    ))]
-    _marker: core::marker::PhantomData<A>,
-}
-
-#[cfg(not(feature = "sync"))]
-impl<A: Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for Env<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Env")
-            .field("bindings_vec", &self.bindings_vec)
-            .finish()
-    }
-}
-
-#[cfg(all(
-    feature = "sync",
-    not(all(
-        feature = "biased",
-        feature = "allocator-api2",
-        not(feature = "triomphe")
-    ))
-))]
-impl<A: Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for Env<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Env").field("bindings", &self.bindings).finish()
-    }
-}
-
-#[cfg(all(
-    feature = "sync",
-    feature = "biased",
-    feature = "allocator-api2",
-    not(feature = "triomphe")
-))]
-impl<A: Allocator + Clone + Send + Sync + 'static> core::fmt::Debug for Env<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Env").field("bindings", &self.bindings).finish()
-    }
-}
-
-#[cfg(all(
-    feature = "sync",
-    feature = "biased",
-    feature = "allocator-api2",
-    not(feature = "triomphe")
-))]
-impl<A: Allocator + Clone + Send + Sync + 'static> Clone for Env<A> {
-    fn clone(&self) -> Self {
-        Self {
-            bindings: self.bindings.clone(),
-        }
-    }
-}
-
-#[cfg(all(
-    feature = "sync",
-    not(all(
-        feature = "biased",
-        feature = "allocator-api2",
-        not(feature = "triomphe")
-    ))
-))]
-impl<A: Allocator + Clone + Send + Sync + 'static> Clone for Env<A> {
-    fn clone(&self) -> Self {
-        Self {
-            bindings: self.bindings.clone(),
-            _marker: core::marker::PhantomData,
-        }
-    }
-}
-
-#[cfg(not(feature = "sync"))]
-impl<A: Allocator + Clone + Send + Sync + 'static> Clone for Env<A> {
-    fn clone(&self) -> Self {
-        Self {
-            bindings_vec: self.bindings_vec.clone(),
-            _marker: core::marker::PhantomData,
-        }
-    }
 }
 
 #[cfg(not(feature = "sync"))]
 impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
-    pub fn extract(&self, idx: usize) -> Option<SteelVal> {
+    pub fn extract(&self, idx: usize) -> Option<SteelValGeneric<A>> {
         self.bindings_vec.get(idx).cloned()
     }
 
@@ -298,18 +179,20 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
         self.bindings_vec.len()
     }
 
-    /// top level global env has no parent
-    pub fn root() -> Self {
+    /// top level global env has no parent -- `alloc` is only used by the gated combo's
+    /// storage, but every combo needs the same constructor signature so callers (vm.rs) don't
+    /// need to know which one they're building against.
+    pub fn root_in(alloc: A) -> Self {
+        let _ = alloc;
         Env {
             bindings_vec: Vec::with_capacity(1024),
-            _marker: core::marker::PhantomData,
         }
     }
 
     #[cfg(feature = "dynamic")]
     pub(crate) fn _print_diagnostics(&self) {
         for (idx, value) in self.bindings_vec.iter().enumerate() {
-            if let SteelVal::Closure(b) = value {
+            if let SteelValGeneric::Closure(b) = value {
                 let count = b.call_count();
                 if count > 0 {
                     println!("Function: {} - Count: {}", idx, b.call_count());
@@ -319,23 +202,23 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
     }
 
     #[inline(always)]
-    pub fn repl_lookup_idx(&self, idx: usize) -> SteelVal {
+    pub fn repl_lookup_idx(&self, idx: usize) -> SteelValGeneric<A> {
         self.bindings_vec[idx].clone()
     }
 
     #[inline(always)]
-    pub fn repl_maybe_lookup_idx(&self, idx: usize) -> Option<SteelVal> {
+    pub fn repl_maybe_lookup_idx(&self, idx: usize) -> Option<SteelValGeneric<A>> {
         // Look up the bindings using the local copy
         self.bindings_vec.get(idx).cloned()
     }
 
     /// Get the value located at that index
-    pub fn _repl_get_idx(&self, idx: usize) -> &SteelVal {
+    pub fn _repl_get_idx(&self, idx: usize) -> &SteelValGeneric<A> {
         &self.bindings_vec[idx]
     }
 
     #[inline]
-    pub fn repl_define_idx(&mut self, idx: usize, val: SteelVal) {
+    pub fn repl_define_idx(&mut self, idx: usize, val: SteelValGeneric<A>) {
         if idx < self.bindings_vec.len() {
             self.bindings_vec[idx] = val;
         } else {
@@ -347,7 +230,7 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
                 // assuming that the values then get actually updated
                 // to the correct values.
                 for _ in 0..(idx - self.bindings_vec.len()) {
-                    self.bindings_vec.push(SteelVal::Void);
+                    self.bindings_vec.push(SteelValGeneric::Void);
                 }
             }
 
@@ -356,19 +239,19 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
         }
     }
 
-    pub fn repl_set_idx(&mut self, idx: usize, val: SteelVal) -> Result<SteelVal> {
+    pub fn repl_set_idx(&mut self, idx: usize, val: SteelValGeneric<A>) -> Result<SteelValGeneric<A>> {
         let output = self.bindings_vec[idx].clone();
         self.bindings_vec[idx] = val;
         Ok(output)
     }
 
     #[inline]
-    pub fn add_root_value(&mut self, idx: usize, val: SteelVal) {
+    pub fn add_root_value(&mut self, idx: usize, val: SteelValGeneric<A>) {
         // self.bindings_map.insert(idx, val);
         self.repl_define_idx(idx, val);
     }
 
-    pub fn roots(&self) -> &Vec<SteelVal> {
+    pub fn roots(&self) -> &Vec<SteelValGeneric<A>> {
         &self.bindings_vec
     }
 }
@@ -386,11 +269,13 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
         self.bindings.0.len()
     }
 
-    /// top level global env has no parent
-    pub fn root() -> Self {
+    /// top level global env has no parent -- `alloc` is only used by the gated combo's
+    /// storage, but every combo needs the same constructor signature so callers (vm.rs) don't
+    /// need to know which one they're building against.
+    pub fn root_in(alloc: A) -> Self {
+        let _ = alloc;
         Env {
             bindings: SharedVectorWrapper(AtomicSharedVector::with_capacity(1024)),
-            _marker: core::marker::PhantomData,
         }
     }
 
@@ -399,50 +284,49 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
             bindings: SharedVectorWrapper(
                 self.bindings.clone().0.into_unique().into_shared_atomic(),
             ),
-            _marker: core::marker::PhantomData,
         }
     }
 
     #[inline(always)]
-    pub fn repl_lookup_idx(&self, idx: usize) -> SteelVal {
+    pub fn repl_lookup_idx(&self, idx: usize) -> SteelValGeneric<A> {
         // Look up the bindings using the local copy
         self.bindings.0[idx].clone()
     }
 
     #[inline(always)]
-    pub fn repl_maybe_lookup_idx(&self, idx: usize) -> Option<SteelVal> {
+    pub fn repl_maybe_lookup_idx(&self, idx: usize) -> Option<SteelValGeneric<A>> {
         // Look up the bindings using the local copy
         self.bindings.0.get(idx).cloned()
     }
 
     #[inline]
-    pub fn update_env(&mut self, vec: SharedVectorWrapper) {
+    pub fn update_env(&mut self, vec: SharedVectorWrapper<A>) {
         self.bindings = vec;
     }
 
     #[inline]
     pub(crate) fn default_env(&mut self) {
-        static DEFAULT_ENV: Lazy<SharedVectorWrapper> =
-            Lazy::new(|| SharedVectorWrapper(shared_vector::arc_vector!()));
-
-        self.bindings = DEFAULT_ENV.clone();
+        // `SharedVectorWrapper<A>` can't live in a `static` for arbitrary `A` (statics can't
+        // be generic), so unlike the concrete version this used to be, there's no shared
+        // empty-buffer cache to reuse here -- just build a fresh empty one.
+        self.bindings = SharedVectorWrapper(shared_vector::arc_vector!());
     }
 
-    pub(crate) fn drain_env(&mut self) -> SharedVectorWrapper {
+    pub(crate) fn drain_env(&mut self) -> SharedVectorWrapper<A> {
         let output = self.bindings.clone();
         self.default_env();
         output
     }
 
     #[inline(always)]
-    pub fn repl_set_idx(&mut self, idx: usize, val: SteelVal) -> Result<SteelVal> {
+    pub fn repl_set_idx(&mut self, idx: usize, val: SteelValGeneric<A>) -> Result<SteelValGeneric<A>> {
         let guard = self.bindings.0.get_mut(idx).unwrap();
         let output = guard.clone();
         *guard = val;
         Ok(output)
     }
 
-    pub fn roots(&self) -> &[SteelVal] {
+    pub fn roots(&self) -> &[SteelValGeneric<A>] {
         self.bindings.0.as_slice()
     }
 }
@@ -514,17 +398,3 @@ impl<A: Allocator + Clone + Send + Sync + 'static> Env<A> {
     }
 }
 
-// `Env::root()` (no allocator argument) is only meaningful for `Global`, which can be
-// conjured "for free" -- see the same reasoning on `SteelString::from` (rvals.rs). Any other
-// `A` must go through `Env::root_in`.
-#[cfg(all(
-    feature = "sync",
-    feature = "biased",
-    feature = "allocator-api2",
-    not(feature = "triomphe")
-))]
-impl Env<Global> {
-    pub fn root() -> Self {
-        Self::root_in(Global)
-    }
-}

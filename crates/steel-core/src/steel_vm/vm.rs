@@ -244,7 +244,7 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> StackFrame::<A> {
     /// The `A`-generic counterpart to `main` (which needs `Gc::new`/`ByteCodeLambda::main`,
     /// only available for `Global`).
     pub fn main_in(alloc: A) -> Self {
-        let function = Gc::new_in(
+        let function = gc_new_in(
             ByteCodeLambda::rooted_in(
                 StandardShared::from(&[] as &[DenseInstruction]),
                 alloc.clone(),
@@ -712,7 +712,7 @@ fn hot_path_builtin_dispatch<A: crate::gc::Allocator + Clone + Send + Sync + 'st
         let dirs = &ctx.thread.compiler.read().search_dirs;
         let relative = crate::compiler::modules::fully_qualified_to_relative(last, dirs).unwrap();
 
-        return Some(Ok(SteelValGeneric::StringV(SteelString::new_in(
+        return Some(Ok(SteelValGeneric::StringV(steel_string_new_in(
             relative.to_str().unwrap(),
             ctx.thread.alloc.clone(),
         ))));
@@ -927,6 +927,60 @@ fn as_concrete_continuation<A: crate::gc::Allocator + Clone + Send + Sync + 'sta
     } else {
         None
     }
+}
+
+/// `Gc::new_in`-equivalent that also compiles outside the gated combo, where `Gc<T>` (the
+/// single-parameter form) always allocates via `Global` and has no `new_in` at all -- mirrors
+/// the same cfg split `CaptureVec<A>`'s own `empty_captures_in`/`captures_with_capacity_in`
+/// already use. The return type is whatever `Gc<T>`/`Gc<T, A>` resolves to per combo, so this
+/// matches any of the `*Gc<A>` aliases (`ByteCodeLambdaGc<A>`, `PairGc<A>`, ...) built from it.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+fn gc_new_in<T, A: crate::gc::Allocator + Clone + Send + Sync + 'static>(val: T, alloc: A) -> Gc<T, A> {
+    Gc::new_in(val, alloc)
+}
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+fn gc_new_in<T, A: crate::gc::Allocator + Clone + Send + Sync + 'static>(val: T, _alloc: A) -> Gc<T> {
+    Gc::new(val)
+}
+
+/// Same idea as `gc_new_in`, for `SteelString::new_in` -- outside the gated combo,
+/// `SteelString<A>`'s data is always `Global`-backed regardless of `A` (see its definition),
+/// so this just falls back to the existing generic `From<&str>` impl and ignores `alloc`.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+fn steel_string_new_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    s: &str,
+    alloc: A,
+) -> SteelString<A> {
+    SteelString::new_in(s, alloc)
+}
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+fn steel_string_new_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    s: &str,
+    _alloc: A,
+) -> SteelString<A> {
+    SteelString::from(s)
 }
 
 /// Same as `as_concrete_vmcore`, for a shared reference.
@@ -1652,7 +1706,7 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> SteelThread<A> {
 
         let keep_alive = instructions.clone();
 
-        self.current_frame.set_function(Gc::new_in(
+        self.current_frame.set_function(gc_new_in(
             ByteCodeLambda::rooted_in(keep_alive.clone(), self.alloc.clone()),
             self.alloc.clone(),
         ));
@@ -4988,7 +5042,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
                 constructed_lambda
             };
 
-            let constructed_lambda = Gc::new_in(constructed_lambda, self.thread.alloc.clone());
+            let constructed_lambda = gc_new_in(constructed_lambda, self.thread.alloc.clone());
 
             self.thread
                 .function_interner
@@ -5195,7 +5249,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
         };
 
         let value =
-            SteelValGeneric::<A>::Closure(Gc::new_in(constructed_lambda, self.thread.alloc.clone()));
+            SteelValGeneric::<A>::Closure(gc_new_in(constructed_lambda, self.thread.alloc.clone()));
 
         self.thread.stack.push(value);
 
@@ -8318,7 +8372,7 @@ fn cons_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
             right.cons_mut(left);
             Ok(SteelValGeneric::ListV(right.clone()))
         }
-        (left, right) => Ok(SteelValGeneric::<A>::Pair(Gc::new_in(
+        (left, right) => Ok(SteelValGeneric::<A>::Pair(gc_new_in(
             crate::values::lists::Pair::cons(left, right.clone()),
             alloc.clone(),
         ))),
@@ -8781,7 +8835,7 @@ fn constant_to_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
                 fields,
                 type_descriptor: s.type_descriptor,
             };
-            Ok(SteelValGeneric::CustomStruct(Gc::new_in(new_struct, alloc.clone())))
+            Ok(SteelValGeneric::CustomStruct(gc_new_in(new_struct, alloc.clone())))
         }
         SteelVal::PortV(p) => Ok(SteelValGeneric::PortV(p.clone())),
         SteelVal::Custom(c) => Ok(SteelValGeneric::Custom(c.clone())),
@@ -8803,10 +8857,10 @@ fn constant_to_generic<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
                 captures,
             );
 
-            Ok(SteelValGeneric::Closure(Gc::new_in(lambda, alloc.clone())))
+            Ok(SteelValGeneric::Closure(gc_new_in(lambda, alloc.clone())))
         }
-        SteelVal::StringV(s) => Ok(SteelValGeneric::StringV(SteelString::new_in(s, alloc.clone()))),
-        SteelVal::SymbolV(s) => Ok(SteelValGeneric::SymbolV(SteelString::new_in(s, alloc.clone()))),
+        SteelVal::StringV(s) => Ok(SteelValGeneric::StringV(steel_string_new_in(s, alloc.clone()))),
+        SteelVal::SymbolV(s) => Ok(SteelValGeneric::SymbolV(steel_string_new_in(s, alloc.clone()))),
         SteelVal::ListV(l) => {
             let items = l
                 .iter()
@@ -8967,7 +9021,7 @@ fn dispatch_struct_boxed_function<A: crate::gc::Allocator + Clone + Send + Sync 
                     fields,
                     type_descriptor: spec.descriptor,
                 };
-                Ok(SteelValGeneric::CustomStruct(Gc::new_in(new_struct, alloc.clone())))
+                Ok(SteelValGeneric::CustomStruct(gc_new_in(new_struct, alloc.clone())))
             }
             crate::values::structs::StructFunctionType::Predicate => {
                 let Some(arg) = args.first() else {
