@@ -84,6 +84,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "allocator-api2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -449,7 +458,7 @@ version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
 ]
 
 [[package]]
@@ -1404,6 +1413,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "educe"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e451fac8dd8dece16234604bf1efce6e90fddd8ab6ad4d66eec0eca5160959dd"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1423,6 +1444,26 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "enum-ordinalize"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89dd01549b09589510cf0647475075d12071456586d70f5c75c98ae2a5537677"
+dependencies = [
+ "enum-ordinalize-derive",
+]
+
+[[package]]
+name = "enum-ordinalize-derive"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
 
 [[package]]
 name = "env_home"
@@ -1833,7 +1874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "serde",
 ]
 
@@ -2156,7 +2197,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8490eb8daae746b8d5ba6f95d7aec634cd05cf687723ce62e4e3c6886f2a8030"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "generic_singleton",
  "smallvec",
 ]
@@ -3194,7 +3235,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc06e6b318142614e4a48bc725abbf08ff166694835c43c9dae5a9009704639a"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "bumpalo",
  "hashbrown 0.15.5",
  "log",
@@ -3658,11 +3699,11 @@ dependencies = [
 
 [[package]]
 name = "shared_vector"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aacfea9afcf271e69d700140dc2a3e2ff44b1092dd0de71fdd4e5c26672a2"
+checksum = "db178a7b1e552c11440665d314451b8dc12bfc4da84212728292bbbd08f28f6f"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.4.0",
 ]
 
 [[package]]
@@ -3827,6 +3868,7 @@ name = "steel-core"
 version = "0.8.2"
 dependencies = [
  "abi_stable",
+ "allocator-api2 0.4.0",
  "anyhow",
  "arc-swap",
  "async-ffi",
@@ -3844,6 +3886,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "crossbeam-utils",
+ "educe",
  "env_home",
  "futures-executor",
  "futures-task",
@@ -4018,6 +4061,7 @@ dependencies = [
 name = "steel-rc"
 version = "0.8.2"
 dependencies = [
+ "allocator-api2 0.4.0",
  "dashmap 6.1.0",
  "parking_lot",
  "rustc-hash",
@@ -4154,6 +4198,17 @@ name = "syn"
 version = "2.0.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e614ed320ac28113fa64972c4262d5dbc89deacdfd00c34a3e4cea073243c12"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",

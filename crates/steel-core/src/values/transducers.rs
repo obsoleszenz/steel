@@ -1,18 +1,21 @@
 use crate::gc::Gc;
-use crate::rvals::Result;
+use crate::rvals::{Result, SteelValGeneric};
 use crate::SteelVal;
 
 use crate::core::utils::{arity_check, declare_const_ref_functions};
 
+type Alloc = crate::gc::Global;
+
 // Make a transducer actually contain an option to a rooted value, otherwise
 // it is a source agnostic transformer on the (eventual) input
-#[derive(Clone, PartialEq, Hash)]
-pub struct Transducer {
+#[derive(educe::Educe)]
+#[educe(Clone, PartialEq, Hash, Default)]
+pub struct Transducer<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     // root: Gc<SteelVal>,
-    pub ops: Vec<Transducers>,
+    pub ops: Vec<Transducers<A>>,
 }
 
-impl Transducer {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Transducer<A> {
     pub fn new() -> Self {
         Transducer { ops: Vec::new() }
     }
@@ -21,50 +24,46 @@ impl Transducer {
         self.ops.append(&mut other.ops)
     }
 
-    pub fn push(&mut self, t: Transducers) {
+    pub fn push(&mut self, t: Transducers<A>) {
         self.ops.push(t);
     }
 }
 
-impl Default for Transducer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, PartialEq, Hash)]
-pub enum Transducers {
-    Map(SteelVal),          // function
-    Filter(SteelVal),       // function
-    Take(SteelVal),         // integer
-    Drop(SteelVal),         // integer
-    FlatMap(SteelVal),      // function
-    Flatten,                // Takes nothing
-    Window(SteelVal),       // integer
-    TakeWhile(SteelVal),    // function
-    DropWhile(SteelVal),    // function
-    Extend(SteelVal),       // Collection
-    Cycle,                  // Continue forever
-    Enumerating,            // turns (a b c) into ((0 a) (1 b) (2 c))
-    Zipping(SteelVal),      // Combine with another iterator, either a Collection or a Transducer
-    Interleaving(SteelVal), // Interleave with another interator, either a Collection or a Transducer
+#[derive(educe::Educe)]
+#[educe(Clone, PartialEq, Hash)]
+pub enum Transducers<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
+    Map(SteelValGeneric<A>),          // function
+    Filter(SteelValGeneric<A>),       // function
+    Take(SteelValGeneric<A>),         // integer
+    Drop(SteelValGeneric<A>),         // integer
+    FlatMap(SteelValGeneric<A>),      // function
+    Flatten,                          // Takes nothing
+    Window(SteelValGeneric<A>),       // integer
+    TakeWhile(SteelValGeneric<A>),    // function
+    DropWhile(SteelValGeneric<A>),    // function
+    Extend(SteelValGeneric<A>),       // Collection
+    Cycle,                            // Continue forever
+    Enumerating,                      // turns (a b c) into ((0 a) (1 b) (2 c))
+    Zipping(SteelValGeneric<A>), // Combine with another iterator, either a Collection or a Transducer
+    Interleaving(SteelValGeneric<A>), // Interleave with another interator, either a Collection or a Transducer
 
     // Optimized versions:
     // Map pair will automatically expand the list into a pair.
-    MapPair(SteelVal),
+    MapPair(SteelValGeneric<A>),
 }
 
 // This should just describe how a sequence of values can be reduced
 // assert that the function passed in has an arity of 2
 // and the initival
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ReducerFunc {
-    pub(crate) initial_value: SteelVal,
-    pub(crate) function: SteelVal,
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReducerFunc<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
+    pub(crate) initial_value: SteelValGeneric<A>,
+    pub(crate) function: SteelValGeneric<A>,
 }
 
-impl ReducerFunc {
-    fn new(initial_value: SteelVal, function: SteelVal) -> Self {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> ReducerFunc<A> {
+    fn new(initial_value: SteelValGeneric<A>, function: SteelValGeneric<A>) -> Self {
         ReducerFunc {
             initial_value,
             function,
@@ -74,9 +73,9 @@ impl ReducerFunc {
 
 // Defines how to collect a function
 // defaults to the same input type?
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Reducer {
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Reducer<A: crate::gc::Allocator + Clone + Send + Sync + 'static = Alloc> {
     // Sum the sequence
     Sum,
     // Multiply the sequence
@@ -102,9 +101,9 @@ pub enum Reducer {
     // Consumes the iterator, giving the last value
     Last,
     // For-each -> calls a function for each value in the sequence
-    ForEach(SteelVal),
+    ForEach(SteelValGeneric<A>),
     // Collect according to the function
-    Generic(ReducerFunc),
+    Generic(ReducerFunc<A>),
 }
 
 macro_rules! into_collection {

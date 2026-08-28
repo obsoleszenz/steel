@@ -21,7 +21,7 @@ use crate::{
     },
     rvals::{
         AsRefSteelVal, Custom, IntoSteelVal, OpaqueIterator, RestArgsIter, SteelComplex,
-        SteelVector,
+        SteelValGeneric, SteelVector,
     },
     steel_vm::vm::{Continuation, ContinuationMark, Synchronizer, VmCore},
     values::lists::List,
@@ -64,6 +64,7 @@ use super::{
 
 #[cfg(feature = "sync")]
 use super::lists::Pair;
+use super::lists::PairGc;
 
 #[cfg(feature = "sync")]
 use super::Vector;
@@ -159,7 +160,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     }
 
     fn visit(&mut self) -> Self::Output {
-        use SteelVal::*;
+        use crate::rvals::SteelValGeneric::*;
 
         while let Some(value) = self.pop_front() {
             if self.slots.is_empty() {
@@ -1509,8 +1510,11 @@ impl<T: HeapAble + 'static> FreeList<T> {
     }
 }
 
-impl FreeList<Vec<SteelVal>> {
-    fn allocate_vec(&mut self, value: impl Iterator<Item = SteelVal>) -> HeapRef<Vec<SteelVal>> {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> FreeList<Vec<SteelValGeneric<A>>> {
+    fn allocate_vec(
+        &mut self,
+        value: impl Iterator<Item = SteelValGeneric<A>>,
+    ) -> HeapRef<Vec<SteelValGeneric<A>>> {
         // Drain, moving values around...
         // is that expensive?
         let guard = &mut self.elements[self.cursor];
@@ -1626,21 +1630,21 @@ fn spawn_background_dropper<T: HeapAble + Sync + Send + 'static>(
 /// we attempt to do a small collection by just dropping any values with no weak counts
 /// pointing to it.
 #[derive(Clone)]
-pub struct Heap {
+pub struct Heap<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     count: usize,
-    mark_and_sweep_queue: Vec<SteelVal>,
+    mark_and_sweep_queue: Vec<SteelValGeneric<A>>,
 
     maybe_memory_size: usize,
 
     skip_minor_collection: bool,
-    memory_free_list: FreeList<SteelVal>,
-    vector_free_list: FreeList<Vec<SteelVal>>,
+    memory_free_list: FreeList<SteelValGeneric<A>>,
+    vector_free_list: FreeList<Vec<SteelValGeneric<A>>>,
 }
 
 #[cfg(feature = "sync")]
-unsafe impl Send for Heap {}
+unsafe impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Send for Heap<A> {}
 #[cfg(feature = "sync")]
-unsafe impl Sync for Heap {}
+unsafe impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Sync for Heap<A> {}
 
 // Contiguous... no good? Perhaps a free list is actually better here?
 // Can reuse the allocations more effectively, and can compact where needed.
@@ -1651,7 +1655,7 @@ struct MemorySpace {
 
 type MemoryBlock = (Vec<HeapValue>, Vec<HeapVector>);
 
-impl Heap {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Heap<A> {
     pub fn new() -> Self {
         Heap {
             count: 0,
@@ -1680,15 +1684,15 @@ impl Heap {
 
     pub fn collection<'a>(
         &mut self,
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &'a mut Synchronizer,
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &'a mut Synchronizer<A>,
         force_full: bool,
     ) {
         self.value_collection(
-            &SteelVal::Void,
+            &SteelValGeneric::<A>::Void,
             roots,
             live_functions,
             globals,
@@ -1698,27 +1702,27 @@ impl Heap {
         );
     }
 
-    pub fn allocate_without_collection(&mut self, value: SteelVal) -> HeapRef<SteelVal> {
+    pub fn allocate_without_collection(&mut self, value: SteelValGeneric<A>) -> HeapRef<SteelValGeneric<A>> {
         self.memory_free_list.allocate(value)
     }
 
     pub fn allocate_vec_without_collection(
         &mut self,
-        value: Vec<SteelVal>,
-    ) -> HeapRef<Vec<SteelVal>> {
+        value: Vec<SteelValGeneric<A>>,
+    ) -> HeapRef<Vec<SteelValGeneric<A>>> {
         self.vector_free_list.allocate(value)
     }
 
     // Clean up the values?
     pub fn allocate<'a>(
         &mut self,
-        value: SteelVal,
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &'a mut Synchronizer,
-    ) -> HeapRef<SteelVal> {
+        value: SteelValGeneric<A>,
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &'a mut Synchronizer<A>,
+    ) -> HeapRef<SteelValGeneric<A>> {
         self.value_collection(
             &value,
             roots,
@@ -1733,12 +1737,12 @@ impl Heap {
 
     fn value_collection<'a>(
         &mut self,
-        value: &SteelVal,
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &mut Synchronizer,
+        value: &SteelValGeneric<A>,
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &mut Synchronizer<A>,
         force: bool,
     ) {
         #[cfg(feature = "biased")]
@@ -1749,7 +1753,7 @@ impl Heap {
         if self.memory_free_list.percent_full() > 0.95 || force {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
-            log::debug!(target: "gc", "SteelVal gc invocation");
+            log::debug!(target: "gc", "SteelValGeneric<A> gc invocation");
             self.memory_free_list.weak_collection();
 
             log::debug!(target: "gc", "Memory size post weak collection: {}", self.memory_free_list.percent_full());
@@ -1802,13 +1806,13 @@ impl Heap {
 
     pub fn allocate_vector<'a>(
         &mut self,
-        values: Vec<SteelVal>,
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &'a mut Synchronizer,
-    ) -> HeapRef<Vec<SteelVal>> {
+        values: Vec<SteelValGeneric<A>>,
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &'a mut Synchronizer<A>,
+    ) -> HeapRef<Vec<SteelValGeneric<A>>> {
         // todo!();
 
         self.vector_collection(
@@ -1827,12 +1831,12 @@ impl Heap {
 
     fn vector_collection<'a>(
         &mut self,
-        values: &[SteelVal],
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &'a mut Synchronizer,
+        values: &[SteelValGeneric<A>],
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &'a mut Synchronizer<A>,
         force: bool,
     ) {
         #[cfg(feature = "biased")]
@@ -1852,7 +1856,7 @@ impl Heap {
         if self.vector_free_list.percent_full() > 0.95 || force {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
-            log::debug!(target: "gc", "Vec<SteelVal> gc invocation");
+            log::debug!(target: "gc", "Vec<SteelValGeneric<A>> gc invocation");
             self.vector_free_list.weak_collection();
             self.vector_free_list.calculate_slots_reachable();
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -1904,13 +1908,13 @@ impl Heap {
 
     pub fn allocate_vector_iter<'a>(
         &mut self,
-        values: impl Iterator<Item = SteelVal> + Clone,
-        roots: &'a [SteelVal],
-        live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &'a mut Synchronizer,
-    ) -> HeapRef<Vec<SteelVal>> {
+        values: impl Iterator<Item = SteelValGeneric<A>> + Clone,
+        roots: &'a [SteelValGeneric<A>],
+        live_functions: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &'a mut Synchronizer<A>,
+    ) -> HeapRef<Vec<SteelValGeneric<A>>> {
         #[cfg(feature = "biased")]
         {
             steel_rc::QueueHandle::run_explicit_merge();
@@ -1927,7 +1931,7 @@ impl Heap {
         if self.vector_free_list.percent_full() > 0.95 {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
-            log::debug!(target: "gc", "Vec<SteelVal> gc invocation");
+            log::debug!(target: "gc", "Vec<SteelValGeneric<A>> gc invocation");
             self.vector_free_list.weak_collection();
             self.vector_free_list.calculate_slots_reachable();
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -1980,14 +1984,14 @@ impl Heap {
 
     fn mark_and_sweep_new<'a>(
         &mut self,
-        root_value: Option<SteelVal>,
-        root_vector: impl Iterator<Item = SteelVal>,
-        roots: &'a [SteelVal],
-        function_stack: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &'a [SteelVal],
-        tls: &'a [SteelVal],
-        synchronizer: &mut Synchronizer,
-    ) -> MarkAndSweepStats {
+        root_value: Option<SteelValGeneric<A>>,
+        root_vector: impl Iterator<Item = SteelValGeneric<A>>,
+        roots: &'a [SteelValGeneric<A>],
+        function_stack: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &'a [SteelValGeneric<A>],
+        tls: &'a [SteelValGeneric<A>],
+        synchronizer: &mut Synchronizer<A>,
+    ) -> MarkAndSweepStats<A> {
         let stats = self.mark(
             root_value,
             root_vector,
@@ -2024,14 +2028,14 @@ impl Heap {
 
     fn mark<'a>(
         &mut self,
-        root_value: Option<SteelVal>,
-        root_vector: impl Iterator<Item = SteelVal>,
-        roots: &[SteelVal],
-        function_stack: impl Iterator<Item = &'a ByteCodeLambda>,
-        globals: &[SteelVal],
-        tls: &[SteelVal],
-        synchronizer: &mut Synchronizer,
-    ) -> MarkAndSweepStats {
+        root_value: Option<SteelValGeneric<A>>,
+        root_vector: impl Iterator<Item = SteelValGeneric<A>>,
+        roots: &[SteelValGeneric<A>],
+        function_stack: impl Iterator<Item = &'a ByteCodeLambda<A>>,
+        globals: &[SteelValGeneric<A>],
+        tls: &[SteelValGeneric<A>],
+        synchronizer: &mut Synchronizer<A>,
+    ) -> MarkAndSweepStats<A> {
         log::debug!(target: "gc", "Marking the heap");
 
         #[cfg(feature = "profiling")]
@@ -2083,7 +2087,7 @@ impl Heap {
                 .unwrap()
                 .roots
                 .values()
-                .for_each(|value| context.push_back(value.clone()))
+                .for_each(|value| push_concrete_into_mark(&mut context, value.clone()))
         }
 
         #[cfg(not(feature = "sync"))]
@@ -2092,7 +2096,7 @@ impl Heap {
                 x.borrow()
                     .roots
                     .values()
-                    .for_each(|value| context.push_back(value.clone()))
+                    .for_each(|value| push_concrete_into_mark(&mut context, value.clone()))
             });
         }
 
@@ -2101,7 +2105,13 @@ impl Heap {
         log::debug!(target: "gc", "Stack size: {}", context.queue.len());
 
         #[cfg(feature = "sync")]
-        let count = MARKER.mark(context.queue);
+        let count = match mark_via_parallel_marker_if_global(&mut context) {
+            Some(stats) => stats,
+            None => {
+                context.visit();
+                context.stats
+            }
+        };
 
         #[cfg(not(feature = "sync"))]
         let count = {
@@ -2217,13 +2227,13 @@ impl ParallelMarker {
 pub trait HeapAble: Clone + core::fmt::Debug + PartialEq + Eq {
     fn empty() -> Self;
 }
-impl HeapAble for SteelVal {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> HeapAble for crate::rvals::SteelValGeneric<A> {
     fn empty() -> Self {
-        SteelVal::Void
+        Self::Void
     }
 }
 
-impl HeapAble for Vec<SteelVal> {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> HeapAble for Vec<crate::rvals::SteelValGeneric<A>> {
     fn empty() -> Self {
         Self::new()
     }
@@ -2353,15 +2363,71 @@ impl<T: Clone + core::fmt::Debug + PartialEq + Eq> HeapAllocated<T> {
     }
 }
 
-pub struct MarkAndSweepContext<'a> {
-    queue: &'a mut Vec<SteelVal>,
-    stats: MarkAndSweepStats,
+pub struct MarkAndSweepContext<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
+    queue: &'a mut Vec<SteelValGeneric<A>>,
+    stats: MarkAndSweepStats<A>,
 }
 
-impl<'a> MarkAndSweepContext<'a> {
+/// `TypeId`-proven identity cast, same technique as `rvals::cycles::push_concrete_into`:
+/// when `A` is actually `Global`, `MarkAndSweepContext<'a, A>` and
+/// `MarkAndSweepContext<'a, Global>` are the same type, so this just reinterprets the
+/// reference's type. Used to bridge into `CustomType::visit_children`, which can't be
+/// generic (object-safety).
+pub(crate) fn as_concrete_mark_context<'a, 'b, A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    ctx: &'b mut MarkAndSweepContext<'a, A>,
+) -> Option<&'b mut MarkAndSweepContext<'a, crate::gc::Global>> {
+    if core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>() {
+        Some(unsafe {
+            core::mem::transmute::<
+                &mut MarkAndSweepContext<'a, A>,
+                &mut MarkAndSweepContext<'a, crate::gc::Global>,
+            >(ctx)
+        })
+    } else {
+        None
+    }
+}
+
+/// Pushes a known-concrete `SteelVal` (from the `Global`-only `mark_rooted`/`as_rooted`
+/// mechanism -- that method only exists on the concrete `SteelVal`) into a generic
+/// `MarkAndSweepContext<A>`. Correctly a no-op for non-`Global` `A`: such an instance's own
+/// graph can never contain anything reachable only via `mark_rooted`, since nothing but
+/// concrete `SteelVal`s are ever rooted that way.
+fn push_concrete_into_mark<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    context: &mut MarkAndSweepContext<A>,
+    value: SteelVal,
+) {
+    if let Some(context) = as_concrete_mark_context(context) {
+        context.push_back(value);
+    }
+}
+
+/// Runs the `sync`-only parallel background-thread-pool marker (`MARKER`, `ParallelMarker`)
+/// when `A == Global`, `None` otherwise. `ParallelMarker`/`SteelValPointer` are
+/// unconditionally concrete (see ALLOCATOR_SPEC.md) -- a real custom allocator on (e.g.) a
+/// realtime audio thread shouldn't be synchronizing with a shared, process-wide background
+/// thread pool anyway, so a non-`Global` `Heap<A>` falls back to the same sequential,
+/// iterative mark pass the `not(sync)` build already uses.
+#[cfg(feature = "sync")]
+fn mark_via_parallel_marker_if_global<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    context: &mut MarkAndSweepContext<A>,
+) -> Option<MarkAndSweepStats<A>> {
+    if core::any::TypeId::of::<A>() != core::any::TypeId::of::<crate::gc::Global>() {
+        return None;
+    }
+
+    // Safety: just proved `A == Global` via `TypeId`, so `Vec<SteelValGeneric<A>>`/
+    // `Vec<SteelVal>` and `MarkAndSweepStats<A>`/`MarkAndSweepStats` are identically the
+    // same types -- this reinterprets values as their own type, nothing more.
+    let queue: &Vec<SteelVal> = unsafe { core::mem::transmute(&*context.queue) };
+    let stats = MARKER.mark(queue);
+    Some(unsafe { core::mem::transmute::<MarkAndSweepStats, MarkAndSweepStats<A>>(stats) })
+}
+
+impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> MarkAndSweepContext<'a, A> {
     pub(crate) fn mark_heap_reference(
         &mut self,
-        heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
+        heap_ref: &StandardSharedMut<HeapAllocated<SteelValGeneric<A>>>,
     ) {
         {
             let mut guard = heap_ref.write();
@@ -2379,7 +2445,7 @@ impl<'a> MarkAndSweepContext<'a> {
     // Visit the heap vector, mark it as visited!
     pub(crate) fn mark_heap_vector(
         &mut self,
-        heap_vector: &StandardSharedMut<HeapAllocated<Vec<SteelVal>>>,
+        heap_vector: &StandardSharedMut<HeapAllocated<Vec<SteelValGeneric<A>>>>,
     ) {
         {
             let mut guard = heap_vector.write();
@@ -2397,16 +2463,20 @@ impl<'a> MarkAndSweepContext<'a> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct MarkAndSweepStats {
+// `keep_alive` stays out of the `Debug` output -- it can hold an unbounded number of
+// kept-alive values.
+#[derive(educe::Educe)]
+#[educe(Default, Clone, Debug)]
+struct MarkAndSweepStats<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     object_count: usize,
     memory_reached_count: usize,
     vector_reached_count: usize,
-    keep_alive: Vec<SteelVal>,
+    #[educe(Debug(ignore))]
+    keep_alive: Vec<SteelValGeneric<A>>,
 }
 
-impl core::ops::Add for MarkAndSweepStats {
-    type Output = MarkAndSweepStats;
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::ops::Add for MarkAndSweepStats<A> {
+    type Output = MarkAndSweepStats<A>;
 
     fn add(mut self, rhs: Self) -> Self::Output {
         self.object_count += rhs.object_count;
@@ -2469,36 +2539,38 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
     }
 }
 
-impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
+impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSearchSteelValVisitor<A>
+    for MarkAndSweepContext<'a, A>
+{
     type Output = ();
 
     fn default_output(&mut self) -> Self::Output {}
 
     // TODO: Do this in parallel, if possible?
-    fn pop_front(&mut self) -> Option<SteelVal> {
+    fn pop_front(&mut self) -> Option<SteelValGeneric<A>> {
         self.queue.pop()
     }
 
-    fn push_back(&mut self, value: SteelVal) {
+    fn push_back(&mut self, value: SteelValGeneric<A>) {
         self.stats.object_count += 1;
 
         // TODO: Determine if all numbers should push back.
         match &value {
-            SteelVal::BoolV(_)
-            | SteelVal::NumV(_)
-            | SteelVal::IntV(_)
-            | SteelVal::CharV(_)
-            | SteelVal::Void
-            | SteelVal::StringV(_)
-            | SteelVal::FuncV(_)
-            | SteelVal::SymbolV(_)
-            | SteelVal::FutureFunc(_)
-            | SteelVal::FutureV(_)
-            | SteelVal::BoxedFunction(_)
-            | SteelVal::MutFunc(_)
-            | SteelVal::BuiltIn(_)
-            | SteelVal::ByteVector(_)
-            | SteelVal::BigNum(_) => (),
+            SteelValGeneric::<A>::BoolV(_)
+            | SteelValGeneric::<A>::NumV(_)
+            | SteelValGeneric::<A>::IntV(_)
+            | SteelValGeneric::<A>::CharV(_)
+            | SteelValGeneric::<A>::Void
+            | SteelValGeneric::<A>::StringV(_)
+            | SteelValGeneric::<A>::FuncV(_)
+            | SteelValGeneric::<A>::SymbolV(_)
+            | SteelValGeneric::<A>::FutureFunc(_)
+            | SteelValGeneric::<A>::FutureV(_)
+            | SteelValGeneric::<A>::BoxedFunction(_)
+            | SteelValGeneric::<A>::MutFunc(_)
+            | SteelValGeneric::<A>::BuiltIn(_)
+            | SteelValGeneric::<A>::ByteVector(_)
+            | SteelValGeneric::<A>::BigNum(_) => (),
             _ => {
                 self.queue.push(value);
             }
@@ -2512,16 +2584,18 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_boxed_function(&mut self, _function: Gc<BoxedDynFunction>) -> Self::Output {}
     // TODO: Revisit this when the boxed iterator is cleaned up
     fn visit_boxed_iterator(&mut self, iterator: GcMut<OpaqueIterator>) -> Self::Output {
-        self.push_back(iterator.read().root.clone());
+        // `OpaqueIterator::root` is always the concrete `SteelVal` (`Global`), regardless
+        // of this context's own `A` -- see ALLOCATOR_SPEC.md.
+        push_concrete_into_mark(self, iterator.read().root.clone());
     }
-    fn visit_boxed_value(&mut self, boxed_value: GcMut<SteelVal>) -> Self::Output {
+    fn visit_boxed_value(&mut self, boxed_value: GcMut<SteelValGeneric<A>>) -> Self::Output {
         self.push_back(boxed_value.read().clone());
     }
 
     fn visit_builtin_function(&mut self, _function: BuiltInSignature) -> Self::Output {}
 
     fn visit_char(&mut self, _c: char) -> Self::Output {}
-    fn visit_closure(&mut self, closure: Gc<ByteCodeLambda>) -> Self::Output {
+    fn visit_closure(&mut self, closure: crate::values::functions::ByteCodeLambdaGc<A>) -> Self::Output {
         // for heap_ref in closure.heap_allocated.borrow().iter() {
         //     self.mark_heap_reference(&heap_ref.strong_ptr())
         // }
@@ -2531,10 +2605,10 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
         }
 
         if let Some(contract) = closure.get_contract_information().as_ref() {
-            self.push_back(contract.clone());
+            push_concrete_into_mark(self, contract.clone());
         }
     }
-    fn visit_continuation(&mut self, continuation: Continuation) -> Self::Output {
+    fn visit_continuation(&mut self, continuation: Continuation<A>) -> Self::Output {
         // TODO: Don't clone this here!
         let continuation = (*continuation.inner.read()).clone();
 
@@ -2580,7 +2654,17 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
-        custom_type.read().visit_children(self);
+        // `CustomType::visit_children` takes a concrete `&mut MarkAndSweepContext<Global>`
+        // -- it's a `dyn`-dispatched trait object method, and generic methods aren't
+        // object-safe, so it can never be made generic over `A` (see ALLOCATOR_SPEC.md).
+        // Under a non-`Global` `A`, a custom type's children won't get marked reachable
+        // by this pass (same pre-existing "TODO: Come back to this" gap as `Global` has
+        // for cycle-safety, just also reachable via this path now) -- a `HeapRef` held
+        // only through a custom type's internals could get reset to empty by a later
+        // collection even while the custom type still points at it.
+        if let Some(ctx) = as_concrete_mark_context(self) {
+            custom_type.read().visit_children(ctx);
+        }
     }
 
     fn visit_float(&mut self, _float: f64) -> Self::Output {}
@@ -2591,24 +2675,24 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
 
     fn visit_future_function(&mut self, _function: BoxedAsyncFunctionSignature) -> Self::Output {}
 
-    fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
+    fn visit_hash_map(&mut self, hashmap: SteelHashMap<A>) -> Self::Output {
         for (key, value) in hashmap.iter() {
             self.push_back(key.clone());
             self.push_back(value.clone());
         }
     }
 
-    fn visit_hash_set(&mut self, hashset: SteelHashSet) -> Self::Output {
+    fn visit_hash_set(&mut self, hashset: SteelHashSet<A>) -> Self::Output {
         for value in hashset.iter() {
             self.push_back(value.clone());
         }
     }
 
-    fn visit_heap_allocated(&mut self, heap_ref: HeapRef<SteelVal>) -> Self::Output {
+    fn visit_heap_allocated(&mut self, heap_ref: HeapRef<SteelValGeneric<A>>) -> Self::Output {
         self.mark_heap_reference(&heap_ref.strong_ptr());
     }
 
-    fn visit_immutable_vector(&mut self, vector: SteelVector) -> Self::Output {
+    fn visit_immutable_vector(&mut self, vector: SteelVector<A>) -> Self::Output {
         for value in vector.iter() {
             self.push_back(value.clone());
         }
@@ -2617,7 +2701,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_rational(&mut self, _: Rational32) -> Self::Output {}
     fn visit_bigrational(&mut self, _: Gc<BigRational>) -> Self::Output {}
 
-    fn visit_list(&mut self, list: List<SteelVal>) -> Self::Output {
+    fn visit_list(&mut self, list: List<SteelValGeneric<A>>) -> Self::Output {
         for value in list {
             self.push_back(value);
         }
@@ -2625,13 +2709,13 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
 
     fn visit_mutable_function(&mut self, _function: MutFunctionSignature) -> Self::Output {}
 
-    fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelVal>>) -> Self::Output {
+    fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelValGeneric<A>>>) -> Self::Output {
         self.mark_heap_vector(&vector.strong_ptr())
     }
 
     fn visit_port(&mut self, _port: SteelPort) -> Self::Output {}
 
-    fn visit_reducer(&mut self, reducer: Gc<Reducer>) -> Self::Output {
+    fn visit_reducer(&mut self, reducer: Gc<Reducer<A>>) -> Self::Output {
         match reducer.as_ref().clone() {
             Reducer::ForEach(f) => self.push_back(f),
             Reducer::Generic(rf) => {
@@ -2645,22 +2729,25 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     // TODO: Revisit this
     fn visit_reference_value(&mut self, _reference: Gc<OpaqueReference<'static>>) -> Self::Output {}
 
-    fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
+    fn visit_steel_struct(
+        &mut self,
+        steel_struct: crate::values::structs::UserDefinedStructGc<A>,
+    ) -> Self::Output {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
     }
 
-    fn visit_stream(&mut self, stream: Gc<LazyStream>) -> Self::Output {
+    fn visit_stream(&mut self, stream: Gc<LazyStream<A>>) -> Self::Output {
         self.push_back(stream.initial_value.clone());
         self.push_back(stream.stream_thunk.clone());
     }
 
-    fn visit_string(&mut self, _string: SteelString) -> Self::Output {}
+    fn visit_string(&mut self, _string: SteelString<A>) -> Self::Output {}
 
-    fn visit_symbol(&mut self, _symbol: SteelString) -> Self::Output {}
+    fn visit_symbol(&mut self, _symbol: SteelString<A>) -> Self::Output {}
 
-    fn visit_syntax_object(&mut self, syntax_object: Gc<Syntax>) -> Self::Output {
+    fn visit_syntax_object(&mut self, syntax_object: Gc<Syntax<A>>) -> Self::Output {
         if let Some(raw) = syntax_object.raw.clone() {
             self.push_back(raw);
         }
@@ -2668,7 +2755,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
         self.push_back(syntax_object.syntax.clone());
     }
 
-    fn visit_transducer(&mut self, transducer: Gc<Transducer>) -> Self::Output {
+    fn visit_transducer(&mut self, transducer: Gc<Transducer<A>>) -> Self::Output {
         for transducer in transducer.ops.iter() {
             match transducer.clone() {
                 crate::values::transducers::Transducers::Map(m) => self.push_back(m),
@@ -2692,7 +2779,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
 
     fn visit_void(&mut self) -> Self::Output {}
 
-    fn visit_pair(&mut self, pair: Gc<super::lists::Pair>) -> Self::Output {
+    fn visit_pair(&mut self, pair: PairGc<A>) -> Self::Output {
         self.push_back(pair.car());
         self.push_back(pair.cdr());
     }
