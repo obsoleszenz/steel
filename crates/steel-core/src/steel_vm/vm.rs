@@ -895,8 +895,8 @@ fn hot_path_native_dispatch<A: crate::gc::Allocator + Clone + Send + Sync + 'sta
 }
 
 /// `TypeId`-proven identity cast for `&mut VmCore<'a, A>` -> `&mut VmCore<'a, Global>`.
-/// `Continuation`/`ContinuationMark` (call/cc's snapshot of the VM state) are Global-only
-/// (see ALLOCATOR_SPEC.md) -- capturing/replaying a continuation is only supported when
+/// `Continuation<A>`/`ContinuationMark<A>` are generic types (see their definitions), but
+/// *capturing/replaying* one (`call/cc`, `call_continuation`) is still only supported when
 /// `A == Global`, a compile-time-enforced restriction (these methods live on
 /// `impl VmCore<'a, Global>` specifically) rather than a runtime one, since call/cc's
 /// snapshot touches the whole VM state, not just one value.
@@ -908,6 +908,21 @@ fn as_concrete_vmcore<'a, 'b, A: crate::gc::Allocator + Clone + Send + Sync + 's
             core::mem::transmute::<&'b mut VmCore<'a, A>, &'b mut VmCore<'a, crate::gc::Global>>(
                 vm,
             )
+        })
+    } else {
+        None
+    }
+}
+
+/// Same idea as `as_concrete_vmcore`, for a `Continuation<A>` value itself: sound only
+/// because `A == Global` has just been proven via `TypeId`, at which point `Continuation<A>`
+/// and `Continuation<Global>` are identically the same type.
+fn as_concrete_continuation<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    continuation: Continuation<A>,
+) -> Option<Continuation<crate::gc::Global>> {
+    if core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>() {
+        Some(unsafe {
+            core::mem::transmute_copy(&core::mem::ManuallyDrop::new(continuation))
         })
     } else {
         None
@@ -1769,33 +1784,35 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> SteelThread<A> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenContinuationMark {
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq)]
+pub struct OpenContinuationMark<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     // Lazily capture the frames we need to?
-    pub(crate) current_frame: StackFrame,
+    pub(crate) current_frame: StackFrame<A>,
     pub(crate) stack_frame_offset: usize,
     instructions: RootedInstructions,
 
     // Captured at creation, everything on the stack
     // from the current frame
-    pub(crate) current_stack_values: Vec<SteelVal>,
+    pub(crate) current_stack_values: Vec<SteelValGeneric<A>>,
 
     ip: usize,
     sp: usize,
     pop_count: usize,
 
     #[cfg(debug_assertions)]
-    closed_continuation: ClosedContinuation,
+    closed_continuation: ClosedContinuation<A>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq)]
 // TODO: This should replace the continuation value.
-pub enum ContinuationMark {
-    Closed(ClosedContinuation),
-    Open(OpenContinuationMark),
+pub enum ContinuationMark<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
+    Closed(ClosedContinuation<A>),
+    Open(OpenContinuationMark<A>),
 }
 
-impl ContinuationMark {
+impl ContinuationMark<crate::gc::Global> {
     pub fn close(&mut self, ctx: &VmCore<'_>) {
         match self {
             ContinuationMark::Closed(_) => {}
@@ -1835,7 +1852,7 @@ impl ContinuationMark {
         }
     }
 
-    fn into_open_mark(self) -> Option<OpenContinuationMark> {
+    fn into_open_mark(self) -> Option<OpenContinuationMark<crate::gc::Global>> {
         if let Self::Open(open) = self {
             Some(open)
         } else {
@@ -1843,7 +1860,7 @@ impl ContinuationMark {
         }
     }
 
-    fn into_closed(self) -> Option<ClosedContinuation> {
+    fn into_closed(self) -> Option<ClosedContinuation<crate::gc::Global>> {
         if let Self::Closed(closed) = self {
             Some(closed)
         } else {
@@ -1852,13 +1869,19 @@ impl ContinuationMark {
     }
 }
 
-impl Continuation {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Continuation<A> {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        StandardShared::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Continuation<crate::gc::Global> {
     #[inline(always)]
-    // Generic over `A`: `weak_continuation_mark` is always concrete (`Continuation`/call/cc
-    // is Global-only, see ALLOCATOR_SPEC.md), but a stack frame under a non-`Global` `A`
-    // will simply never have one set in the first place -- the `Some(cont_mark)` branch,
-    // where `ctx` actually needs to bridge to the concrete world, is only ever reached when
-    // `A == Global` in practice, so the `TypeId`-cast there always succeeds.
+    // `weak_continuation_mark` is always concrete (`Continuation`/call/cc is Global-only,
+    // see ALLOCATOR_SPEC.md), but a stack frame under a non-`Global` `A` will simply never
+    // have one set in the first place -- the `Some(cont_mark)` branch, where `ctx` actually
+    // needs to bridge to the concrete world, is only ever reached when `A == Global` in
+    // practice, so the `TypeId`-cast there always succeeds.
     pub fn close_marks<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
         ctx: &VmCore<'_, A>,
         stack_frame: &StackFrame<A>,
@@ -1979,52 +2002,58 @@ impl Continuation {
         }
     }
 
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        StandardShared::ptr_eq(&self.inner, &other.inner)
-    }
 }
 
-#[derive(Clone, Debug)]
-pub struct Continuation {
+#[derive(educe::Educe)]
+#[educe(Clone, Debug)]
+pub struct Continuation<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     // TODO: This _might_ need to be a weak reference. We'll see!
-    pub(crate) inner: StandardSharedMut<ContinuationMark>,
+    pub(crate) inner: StandardSharedMut<ContinuationMark<A>>,
 }
 
-impl PartialEq for Continuation {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for Continuation<A> {
     fn eq(&self, other: &Self) -> bool {
         *(self.inner.read()) == *(other.inner.read())
     }
 }
 
-impl Eq for Continuation {}
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Eq for Continuation<A> {}
 
-#[derive(Clone, Debug)]
-struct WeakContinuation {
-    pub(crate) inner: WeakSharedMut<ContinuationMark>,
+#[derive(educe::Educe)]
+#[educe(Clone, Debug)]
+struct WeakContinuation<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
+    pub(crate) inner: WeakSharedMut<ContinuationMark<A>>,
 }
 
-impl WeakContinuation {
-    fn from_strong(cont: &Continuation) -> Self {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> WeakContinuation<A> {
+    fn from_strong(cont: &Continuation<A>) -> Self {
         Self {
             inner: StandardShared::downgrade(&cont.inner),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClosedContinuation {
-    pub(crate) stack: Vec<SteelVal>,
-    pub(crate) current_frame: StackFrame,
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedContinuation<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
+    pub(crate) stack: Vec<SteelValGeneric<A>>,
+    pub(crate) current_frame: StackFrame<A>,
     instructions: RootedInstructions,
-    pub(crate) stack_frames: Vec<StackFrame>,
+    pub(crate) stack_frames: Vec<StackFrame<A>>,
     ip: usize,
     sp: usize,
     pop_count: usize,
 
     // #[cfg(feature = "rooted-instructions")]
     // rooted_instructions: Vec<Shared<[DenseInstruction]>>,
+    // Self-referential (a `ClosedContinuation` holding another `ClosedContinuation`), which
+    // would otherwise force educe's automatic bound inference to fall back to a blanket
+    // `A: PartialEq`/`A: Eq` (to avoid an infinite-recursion trait-solver overflow) -- this
+    // field is a debug-only sanity-check shadow copy, not part of what makes two
+    // continuations equal, so it's excluded from both instead.
     #[cfg(debug_assertions)]
-    closed_continuation: Option<Box<ClosedContinuation>>,
+    #[educe(PartialEq(ignore))]
+    closed_continuation: Option<Box<ClosedContinuation<A>>>,
 }
 
 pub trait VmContext {
@@ -2797,7 +2826,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
     // Call with an arbitrary number of arguments
     pub(crate) fn call_cont_with_args(
         &mut self,
-        cont: Continuation,
+        cont: Continuation<A>,
         args: impl IntoIterator<Item = SteelValGeneric<A>>,
     ) -> Result<SteelValGeneric<A>> {
         for arg in args {
@@ -5603,7 +5632,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
     // #[inline(always)]
     // TODO: See if calling continuations can be implemented in terms of the core ABI
     // That way, we dont need a special "continuation" function
-    fn call_continuation(&mut self, continuation: Continuation) -> Result<()> {
+    fn call_continuation(&mut self, continuation: Continuation<A>) -> Result<()> {
         let last =
             self.thread.stack.pop().ok_or_else(
                 throw!(ArityMismatch => "continuation expected 1 argument, found none"),
@@ -5611,8 +5640,8 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> VmCore<'a, A> 
 
         // println!("Calling continuation...");
 
-        match as_concrete_vmcore(self) {
-            Some(concrete_self) => {
+        match as_concrete_vmcore(self).zip(as_concrete_continuation(continuation)) {
+            Some((concrete_self, continuation)) => {
                 Continuation::set_state_from_continuation(concrete_self, continuation)
             }
             None => {

@@ -168,7 +168,8 @@ fn main() -> steel::rvals::Result<()> {
 
     println!("bytes allocated after setup: {}", bump.bytes_used());
 
-    let shift_pressed = realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
+    let shift_pressed =
+        realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
     println!("is-shift-pressed? => {shift_pressed}");
 
     realtime_engine.call_function_by_name_with_args(
@@ -176,7 +177,8 @@ fn main() -> steel::rvals::Result<()> {
         vec![SteelValGeneric::BoolV(true)],
     )?;
 
-    let shift_pressed = realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
+    let shift_pressed =
+        realtime_engine.call_function_by_name_with_args("is-shift-pressed?", vec![])?;
     println!("is-shift-pressed? (after set-shift-pressed! #t) => {shift_pressed}");
 
     // Simulate a small stream of MIDI messages arriving on the "audio thread". Each call
@@ -197,7 +199,10 @@ fn main() -> steel::rvals::Result<()> {
         println!("on-midi-in({status}, {data1}, {data2}) => {result}");
     }
 
-    println!("bytes allocated after processing events: {}", bump.bytes_used());
+    println!(
+        "bytes allocated after processing events: {}",
+        bump.bytes_used()
+    );
 
     // The compiler engine's own (Global-allocated) `on-midi-in` was never called, and never
     // will be -- it exists only so `realtime_engine` could share its compiled bytecode.

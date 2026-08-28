@@ -2608,26 +2608,23 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
             push_concrete_into_mark(self, contract.clone());
         }
     }
-    fn visit_continuation(&mut self, continuation: Continuation) -> Self::Output {
-        // `Continuation`/`ContinuationMark`'s stack and captures are always the concrete
-        // `SteelVal` (`Global`), regardless of this context's own `A` -- see
-        // ALLOCATOR_SPEC.md. Pushed via `push_concrete_into_mark`.
+    fn visit_continuation(&mut self, continuation: Continuation<A>) -> Self::Output {
         // TODO: Don't clone this here!
         let continuation = (*continuation.inner.read()).clone();
 
         match continuation {
             ContinuationMark::Closed(continuation) => {
                 for value in continuation.stack {
-                    push_concrete_into_mark(self, value);
+                    self.push_back(value);
                 }
 
                 for value in &continuation.current_frame.function.captures {
-                    push_concrete_into_mark(self, value.clone());
+                    self.push_back(value.clone());
                 }
 
                 for frame in continuation.stack_frames {
                     for value in &frame.function.captures {
-                        push_concrete_into_mark(self, value.clone());
+                        self.push_back(value.clone());
                     }
 
                     // if let Some(handler) = &frame.handler {
@@ -2637,7 +2634,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
                     if let Some(handler) =
                         frame.attachments.as_ref().and_then(|x| x.handler.clone())
                     {
-                        push_concrete_into_mark(self, handler);
+                        self.push_back(handler);
                     }
                 }
             }

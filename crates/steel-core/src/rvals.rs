@@ -1715,7 +1715,7 @@ pub enum SteelValGeneric<A: crate::gc::Allocator + Clone + Send + Sync + 'static
     /// Custom closure
     BoxedFunction(Gc<BoxedDynFunction>),
     // Continuation
-    ContinuationFunction(Continuation),
+    ContinuationFunction(Continuation<A>),
     // Function Pointer
     // #[cfg(feature = "jit")]
     // CompiledFunction(Box<JitFunctionPointer>),

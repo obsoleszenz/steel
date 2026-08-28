@@ -9,6 +9,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
 
+fn is_allocator_global<A>() -> bool
+where 
+    A: crate::gc::Allocator + Clone + Send + Sync + 'static {
+   core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>()   
+
+}
+
 /// Pushes a known-concrete `SteelVal` (e.g. from `UserDefinedStruct`'s fields,
 /// `ByteCodeLambda`'s captures, or similar Global-only content -- see
 /// ALLOCATOR_SPEC.md) into a generic `A`-parametrized visitor's own queue, preserving
@@ -30,7 +37,7 @@ where
     A: crate::gc::Allocator + Clone + Send + Sync + 'static,
     V: BreadthFirstSearchSteelValVisitor<A>,
 {
-    if core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>() {
+    if is_allocator_global::<A>() {
         // Safety: just proved `A == Global` via `TypeId`, so `SteelValGeneric<A>` and
         // `SteelVal` are identically the same type -- this reinterprets a value as its
         // own type, nothing more.
@@ -686,7 +693,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
     fn visit_future(&mut self, _future: Gc<FutureResult>) -> Self::Output {}
     fn visit_stream(&mut self, _stream: Gc<LazyStream<A>>) -> Self::Output {}
     fn visit_boxed_function(&mut self, _function: Gc<BoxedDynFunction>) -> Self::Output {}
-    fn visit_continuation(&mut self, _continuation: Continuation) -> Self::Output {}
+    fn visit_continuation(&mut self, _continuation: Continuation<A>) -> Self::Output {}
 
     fn visit_list(&mut self, list: List<SteelValGeneric<A>>) -> Self::Output {
         if !self.add(list.identity_tuple(), &SteelValGeneric::ListV(list.clone())) {
@@ -1032,32 +1039,28 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
     }
 
     // Walk the whole thing! This includes the stack and all the stack frames
-    fn visit_continuation(&mut self, continuation: Continuation) {
-        // `Continuation`/`ContinuationMark`'s stack and captures are always the
-        // concrete `SteelVal` (`Global`), regardless of this handler's own `A` --
-        // generalizing the VM's own stack/closures is its own separate phase (see
-        // ALLOCATOR_SPEC.md), not yet done. Pushed into this same handler's own queue
-        // via `push_concrete_into` (not a nested drop pass), preserving the iterative
-        // traversal for a deep continuation stack.
+    fn visit_continuation(&mut self, continuation: Continuation<A>) {
+        // `Continuation<A>`'s stack/captures now match this handler's own `A` directly,
+        // so they're pushed straight into the shared queue -- no bridging needed.
         if let Ok(inner) =
             crate::gc::shared::StandardShared::try_unwrap(continuation.inner).map(|x| x.consume())
         {
             match inner {
                 ContinuationMark::Closed(mut inner) => {
                     for value in core::mem::take(&mut inner.stack) {
-                        push_concrete_into(self, value);
+                        self.push_back(value);
                     }
 
                     if let Some(inner) = inner.current_frame.function.get_mut() {
                         for value in crate::values::functions::take_captures(&mut inner.captures) {
-                            push_concrete_into(self, value);
+                            self.push_back(value);
                         }
                     }
 
                     for mut frame in core::mem::take(&mut inner.stack_frames) {
                         if let Some(inner) = frame.function.get_mut() {
                             for value in crate::values::functions::take_captures(&mut inner.captures) {
-                                push_concrete_into(self, value);
+                                self.push_back(value);
                             }
                         }
                     }
@@ -1065,12 +1068,12 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
 
                 ContinuationMark::Open(mut inner) => {
                     for value in inner.current_stack_values {
-                        push_concrete_into(self, value);
+                        self.push_back(value);
                     }
 
                     if let Some(inner) = inner.current_frame.function.get_mut() {
                         for value in crate::values::functions::take_captures(&mut inner.captures) {
-                            push_concrete_into(self, value);
+                            self.push_back(value);
                         }
                     }
                 }
@@ -1406,7 +1409,7 @@ impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSearch
     }
 
     // Walk the whole thing! This includes the stack and all the stack frames
-    fn visit_continuation(&mut self, continuation: Continuation) {
+    fn visit_continuation(&mut self, continuation: Continuation<A>) {
         if let Ok(inner) = crate::gc::Shared::try_unwrap(continuation.inner).map(|x| x.consume()) {
             match inner {
                 ContinuationMark::Closed(mut inner) => {
@@ -1642,7 +1645,7 @@ pub trait BreadthFirstSearchSteelValVisitor<A: crate::gc::Allocator + Clone + Se
     fn visit_future(&mut self, future: Gc<FutureResult>) -> Self::Output;
     fn visit_stream(&mut self, stream: Gc<LazyStream<A>>) -> Self::Output;
     fn visit_boxed_function(&mut self, function: Gc<BoxedDynFunction>) -> Self::Output;
-    fn visit_continuation(&mut self, continuation: Continuation) -> Self::Output;
+    fn visit_continuation(&mut self, continuation: Continuation<A>) -> Self::Output;
     fn visit_list(&mut self, list: List<SteelValGeneric<A>>) -> Self::Output;
     fn visit_mutable_function(&mut self, function: MutFunctionSignature) -> Self::Output;
     fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelValGeneric<A>>>) -> Self::Output;
@@ -1738,7 +1741,7 @@ pub trait BreadthFirstSearchSteelValVisitor2<A: crate::gc::Allocator + Clone + S
     fn visit_future(&mut self, future: Gc<FutureResult>) -> Self::Output;
     fn visit_stream(&mut self, stream: Gc<LazyStream<A>>) -> Self::Output;
     fn visit_boxed_function(&mut self, function: Gc<BoxedDynFunction>) -> Self::Output;
-    fn visit_continuation(&mut self, continuation: Continuation) -> Self::Output;
+    fn visit_continuation(&mut self, continuation: Continuation<A>) -> Self::Output;
     fn visit_list(&mut self, list: List<SteelValGeneric<A>>) -> Self::Output;
     fn visit_mutable_function(&mut self, function: MutFunctionSignature) -> Self::Output;
     fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelValGeneric<A>>>) -> Self::Output;
@@ -1835,7 +1838,7 @@ pub trait BreadthFirstSearchSteelValReferenceVisitor<'a, A: crate::gc::Allocator
     fn visit_future(&mut self, future: &'a Gc<FutureResult>) -> Self::Output;
     fn visit_stream(&mut self, stream: &'a Gc<LazyStream<A>>) -> Self::Output;
     fn visit_boxed_function(&mut self, function: &'a Gc<BoxedDynFunction>) -> Self::Output;
-    fn visit_continuation(&mut self, continuation: &'a Continuation) -> Self::Output;
+    fn visit_continuation(&mut self, continuation: &'a Continuation<A>) -> Self::Output;
     fn visit_list(&mut self, list: &'a List<SteelValGeneric<A>>) -> Self::Output;
     fn visit_mutable_function(&mut self, function: &'a MutFunctionSignature) -> Self::Output;
     fn visit_mutable_vector(&mut self, vector: &'a HeapRef<Vec<SteelValGeneric<A>>>) -> Self::Output;
@@ -2533,7 +2536,7 @@ impl<'a, A: crate::gc::Allocator + Clone + Send + Sync + 'static> BreadthFirstSe
 
     fn visit_stream(&mut self, _stream: Gc<LazyStream<A>>) -> Self::Output {}
 
-    fn visit_continuation(&mut self, _continuation: Continuation) -> Self::Output {}
+    fn visit_continuation(&mut self, _continuation: Continuation<A>) -> Self::Output {}
 
     fn visit_list(&mut self, list: List<SteelValGeneric<A>>) -> Self::Output {
         for value in list.iter() {
