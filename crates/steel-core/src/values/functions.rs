@@ -25,6 +25,7 @@ use crate::{
     rvals::{
         from_serializable_value, into_serializable_value, AsRefSteelVal, Custom, FunctionSignature,
         HeapSerializer, IntoSteelVal, MutFunctionSignature, SerializableSteelVal, SteelString,
+        SteelValGeneric,
     },
     steel_vm::{
         register_fn::SendSyncStatic,
@@ -101,62 +102,204 @@ impl LambdaMetadataTable {
 #[cfg(feature = "inline-captures")]
 const INLINE_CAPTURE_SIZE: usize = 3;
 
-#[cfg(not(feature = "inline-captures"))]
-pub type CaptureVec = Vec<SteelVal>;
+// `CaptureVec<A>` is cfg-split the same way `Gc<T>`/`Gc<T, A>` is (see gc.rs): only under
+// `sync+biased+allocator-api2` does a closure's captured variables actually get allocated
+// through `A` rather than always through `Global`. `inline-captures` (an opt-in,
+// non-default feature) keeps using plain `smallvec` regardless -- its inline storage never
+// allocates at all, and its heap-spill path has no allocator hook in mainline `smallvec`
+// (see ALLOCATOR_SPEC.md §3.6); that's an orthogonal, already-accepted limitation, not
+// something this phase changes.
+#[cfg(all(
+    not(feature = "inline-captures"),
+    not(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))
+))]
+pub type CaptureVec<A = crate::gc::Global> = Vec<SteelValGeneric<A>>;
 
 #[cfg(feature = "inline-captures")]
-pub type CaptureVec = smallvec::SmallVec<[SteelVal; INLINE_CAPTURE_SIZE]>;
+pub type CaptureVec<A = crate::gc::Global> = smallvec::SmallVec<[SteelValGeneric<A>; INLINE_CAPTURE_SIZE]>;
 
-#[derive(Clone, Debug)]
-pub struct ByteCodeLambda {
+#[cfg(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub type CaptureVec<A = crate::gc::Global> = allocator_api2::vec::Vec<SteelValGeneric<A>, A>;
+
+/// Take the captures out of a `CaptureVec<A>`, leaving an empty one behind. Plain
+/// `mem::take` needs `CaptureVec<A>: Default`, which the gated `allocator_api2::vec::Vec<T,
+/// A>` backing only has for `A: Default` (i.e. `Global`) -- a real custom allocator
+/// generally isn't `Default`. This builds the replacement from the same allocator instance
+/// the original buffer already held, so it works for any `A`.
+#[cfg(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub(crate) fn take_captures<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    captures: &mut CaptureVec<A>,
+) -> CaptureVec<A> {
+    let alloc = captures.allocator().clone();
+    core::mem::replace(captures, allocator_api2::vec::Vec::new_in(alloc))
+}
+
+#[cfg(not(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub(crate) fn take_captures<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    captures: &mut CaptureVec<A>,
+) -> CaptureVec<A> {
+    core::mem::take(captures)
+}
+
+#[cfg(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub(crate) fn empty_captures_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(alloc: A) -> CaptureVec<A> {
+    allocator_api2::vec::Vec::new_in(alloc)
+}
+
+#[cfg(not(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub(crate) fn empty_captures_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    _alloc: A,
+) -> CaptureVec<A> {
+    CaptureVec::default()
+}
+
+/// Same as `empty_captures_in`, but pre-reserves `capacity` slots -- used when the number of
+/// captured variables is known up front (closure construction in the VM's inner loop).
+#[cfg(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub(crate) fn captures_with_capacity_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    capacity: usize,
+    alloc: A,
+) -> CaptureVec<A> {
+    allocator_api2::vec::Vec::with_capacity_in(capacity, alloc)
+}
+
+#[cfg(not(all(
+    not(feature = "inline-captures"),
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub(crate) fn captures_with_capacity_in<A: crate::gc::Allocator + Clone + Send + Sync + 'static>(
+    capacity: usize,
+    _alloc: A,
+) -> CaptureVec<A> {
+    CaptureVec::with_capacity(capacity)
+}
+
+// A closure's own heap block is squarely in scope for allocator-routing (unlike, say, a
+// persistent Vector/HashMap's internal node storage, deferred to a later phase per
+// ALLOCATOR_SPEC.md) -- creating a closure is one of the hottest, most frequent allocations
+// a running program makes. `Gc<T, A>` (the 2-parameter form) only exists at all under
+// `sync+biased+allocator-api2`, so this alias picks the right arity per cfg, the same way
+// `SteelString`/`Env` do.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub type ByteCodeLambdaGc<A> = Gc<ByteCodeLambda<A>, A>;
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+pub type ByteCodeLambdaGc<A> = Gc<ByteCodeLambda<A>>;
+
+#[derive(Clone, educe::Educe)]
+#[educe(Debug)]
+pub struct ByteCodeLambda<A: crate::gc::Allocator + Clone + Send + Sync + 'static = crate::gc::Global> {
     pub(crate) id: u32,
     /// body of the function with identifiers yet to be bound
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     pub(crate) body_exp: RefCell<Shared<[DenseInstruction]>>,
 
     #[cfg(not(feature = "dynamic"))]
+    #[educe(Debug(ignore))]
     pub(crate) body_exp: StandardShared<[DenseInstruction]>,
 
     pub(crate) arity: u16,
 
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     call_count: Cell<usize>,
 
     pub(crate) is_multi_arity: bool,
 
     // Store... some amount inline?
     // pub(crate) captures: Vec<SteelVal>,
-    pub(crate) captures: CaptureVec,
+    #[educe(Debug(ignore))]
+    pub(crate) captures: CaptureVec<A>,
 
     // pub(crate) captures: Box<[SteelVal]>
     #[cfg(feature = "dynamic")]
+    #[educe(Debug(ignore))]
     pub(crate) blocks: RefCell<Vec<(BlockPattern, BlockMetadata)>>,
 
     // This is a little suspicious, but it should give us the necessary information to attach a struct of metadata
     #[cfg(feature = "sync")]
+    #[educe(Debug(ignore))]
     contract: SharedMut<Option<Gc<UserDefinedStruct>>>,
 
     #[cfg(not(feature = "sync"))]
+    #[educe(Debug(ignore))]
     contract: MutContainer<Option<Gc<UserDefinedStruct>>>,
 
     #[cfg(feature = "jit2")]
+    #[educe(Debug(ignore))]
     pub(crate) super_instructions: Option<fn(&mut crate::steel_vm::vm::VmCore)>,
 
     // In the event this is serialized and its been jit compiled, replace
     // the first instruction with this, since this is what is was originally
+    #[educe(Debug(ignore))]
     pub(crate) header: Option<OpCode>,
 }
 
-impl PartialEq for ByteCodeLambda {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> PartialEq for ByteCodeLambda<A> {
     fn eq(&self, other: &Self) -> bool {
         // self.body_exp == other.body_exp &&
         self.arity == other.arity && self.id == other.id
     }
 }
 
-impl Eq for ByteCodeLambda {}
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Eq for ByteCodeLambda<A> {}
 
-impl core::hash::Hash for ByteCodeLambda {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> core::hash::Hash for ByteCodeLambda<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         // self.body_exp.as_ptr().hash(state);
@@ -236,14 +379,14 @@ impl core::ops::Deref for RootedInstructions {
     }
 }
 
-impl ByteCodeLambda {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> ByteCodeLambda<A> {
     pub fn new(
         id: u32,
         body_exp: StandardShared<[DenseInstruction]>,
         arity: usize,
         is_multi_arity: bool,
-        captures: CaptureVec,
-    ) -> ByteCodeLambda {
+        captures: CaptureVec<A>,
+    ) -> ByteCodeLambda<A> {
         ByteCodeLambda {
             id,
 
@@ -275,7 +418,16 @@ impl ByteCodeLambda {
             header: None,
         }
     }
+}
 
+// Deserialization, and the two "no captures yet" bootstrap constructors below, always
+// produce concrete, `Global`-backed content (deserialized values, and empty capture
+// vectors respectively) -- matching the wider design where compile/load-time machinery
+// stays on `Global` and only a running program's own allocations route through `A` (see
+// ALLOCATOR_SPEC.md). `CaptureVec::default()` specifically requires this: an empty
+// `allocator_api2::vec::Vec<T, A>` needs an allocator instance to be constructed, which
+// only `Global` can provide "for free".
+impl ByteCodeLambda<crate::gc::Global> {
     pub(crate) fn from_serialized(
         heap: &mut HeapSerializer,
         mut value: SerializedLambda,
@@ -378,8 +530,23 @@ impl ByteCodeLambda {
             CaptureVec::default(),
         )
     }
+}
 
-    pub fn set_captures(&mut self, captures: CaptureVec) {
+impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> ByteCodeLambda<A> {
+    /// The `A`-generic counterpart to `rooted`/`main` (which need `CaptureVec::default()`,
+    /// only available for `Global`, same as `Gc::new`). Used for the bootstrap/"no captures
+    /// yet" closures `SteelThread<A>::execute` roots the running instructions to.
+    pub fn rooted_in(instructions: StandardShared<[DenseInstruction]>, alloc: A) -> Self {
+        Self::new(
+            SyntaxObjectId::fresh().into(),
+            instructions,
+            0,
+            false,
+            empty_captures_in(alloc),
+        )
+    }
+
+    pub fn set_captures(&mut self, captures: CaptureVec<A>) {
         self.captures = captures;
     }
 
@@ -405,6 +572,15 @@ impl ByteCodeLambda {
         return RootedInstructions {
             inner: StandardShared::as_ptr(&self.body_exp),
         };
+    }
+
+    /// Like `body_exp`, but returns the underlying shared handle directly rather than a
+    /// `RootedInstructions` view -- needed to rebuild a whole new `ByteCodeLambda<A>` (see
+    /// `constant_to_generic` in vm.rs), since bytecode is allocator-independent and can just
+    /// be shared, not re-allocated, when converting a closure to a different `A`.
+    #[cfg(not(feature = "rooted-instructions"))]
+    pub(crate) fn body_exp_shared(&self) -> StandardShared<[DenseInstruction]> {
+        StandardShared::clone(&self.body_exp)
     }
 
     pub fn body_mut_exp(&mut self) -> StandardShared<[DenseInstruction]> {
@@ -456,7 +632,7 @@ impl ByteCodeLambda {
     //     &self.heap_allocated
     // }
 
-    pub fn captures(&self) -> &[SteelVal] {
+    pub fn captures(&self) -> &[SteelValGeneric<A>] {
         &self.captures
     }
 

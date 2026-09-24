@@ -1,5 +1,22 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(all(feature = "jit2", feature = "allocator-api2"))]
+compile_error!(
+    "jit2 and allocator-api2 cannot be enabled together: jit2's compiled super-instructions \
+     are raw `fn(&mut VmCore)` pointers with no allocator-generic representation (see \
+     ALLOCATOR_SPEC.md)"
+);
+
+#[cfg(all(feature = "allocator-api2", not(feature = "without-drop-protection")))]
+compile_error!(
+    "allocator-api2 requires without-drop-protection: the stack-safe iterative drop \
+     machinery (DROP_BUFFER and friends in rvals::cycles) is a `thread_local!`, which Rust \
+     requires to be one fixed, concrete, monomorphic type -- so it can only ever be proven \
+     sound for the concrete `Global` allocator, never for an arbitrary caller-supplied one. \
+     `without-drop-protection` switches to plain structural Drop instead, which needs no \
+     such proof and is allocator-generic for free (see ALLOCATOR_SPEC.md)."
+);
+
 extern crate alloc;
 extern crate im_rc;
 #[macro_use]

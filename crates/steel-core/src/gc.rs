@@ -19,6 +19,12 @@ pub use unsafe_erased_pointers::is_reference_type;
 #[cfg(feature = "sync")]
 use parking_lot::RwLock;
 
+// Always available (allocator-api2 is a normal, tiny, no_std-compatible dependency, not
+// gated behind a feature) so `SteelValGeneric<A>`'s declaration doesn't need to be
+// duplicated per feature combo -- see ALLOCATOR_SPEC.md. The `allocator-api2` *feature*
+// only gates the heavier work of actually threading a non-`Global` `A` through Gc/BiasedRc.
+pub use allocator_api2::alloc::{Allocator, Global};
+
 pub mod shared {
     use alloc::rc::Rc;
     use core::cell::{BorrowError, BorrowMutError, Ref, RefCell, RefMut};
@@ -80,9 +86,34 @@ pub mod shared {
     #[cfg(all(feature = "sync", feature = "triomphe", not(feature = "biased")))]
     pub type SharedMut<T> = triomphe::Arc<RwLock<T>>;
 
-    #[cfg(all(feature = "sync", feature = "biased", not(feature = "triomphe")))]
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub type Shared<T, A = allocator_api2::alloc::Global> = steel_rc::BiasedRc<T, A>;
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        feature = "allocator-api2",
+        not(feature = "triomphe")
+    ))]
+    pub type SharedMut<T, A = allocator_api2::alloc::Global> = steel_rc::BiasedRc<RwLock<T>, A>;
+
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        not(feature = "allocator-api2"),
+        not(feature = "triomphe")
+    ))]
     pub type Shared<T> = steel_rc::BiasedRc<T>;
-    #[cfg(all(feature = "sync", feature = "biased", not(feature = "triomphe")))]
+    #[cfg(all(
+        feature = "sync",
+        feature = "biased",
+        not(feature = "allocator-api2"),
+        not(feature = "triomphe")
+    ))]
     pub type SharedMut<T> = steel_rc::BiasedRc<RwLock<T>>;
 
     #[cfg(feature = "sync")]
@@ -450,10 +481,108 @@ pub mod shared {
 /// When enabled, this allows for complete sandboxing of data types
 /// It does not expose the full functionality of the `Rc` type
 /// but it does allow for some
-#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 // pub struct Gc<T: ?Sized>(pub(crate) Shared<T>);
+//
+// Note: PartialEq/Eq/Hash/PartialOrd/Ord/Debug are implemented manually below rather than via
+// `#[derive(...)]` -- a derive would add `A: PartialEq` etc. bounds (derive can't know the
+// allocator handle doesn't participate in equality/ordering/hashing), which would make
+// `Gc<T, Global>` (the overwhelmingly common case) fail to compile since `Global` implements
+// none of them.
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+pub struct Gc<T: ?Sized + 'static, A: Allocator + Clone + 'static = Global>(
+    pub(crate) Shared<T, A>,
+);
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + PartialEq, A: Allocator + Clone + 'static> PartialEq for Gc<T, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + Eq, A: Allocator + Clone + 'static> Eq for Gc<T, A> {}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + std::hash::Hash, A: Allocator + Clone + 'static> std::hash::Hash for Gc<T, A> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + PartialOrd, A: Allocator + Clone + 'static> PartialOrd for Gc<T, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + Ord, A: Allocator + Clone + 'static> Ord for Gc<T, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[cfg(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+))]
+impl<T: ?Sized + fmt::Debug, A: Allocator + Clone + 'static> fmt::Debug for Gc<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+#[cfg(not(all(
+    feature = "sync",
+    feature = "biased",
+    feature = "allocator-api2",
+    not(feature = "triomphe")
+)))]
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Gc<T: ?Sized + 'static>(pub(crate) Shared<T>);
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Pointer for Gc<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:p}", self.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Pointer for Gc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:p}", self.0)
@@ -476,6 +605,19 @@ pub fn get_object_count() -> usize {
     OBJECT_COUNT.fetch_add(0, Ordering::SeqCst)
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: Clone, A: Allocator + Clone + 'static> Gc<T, A> {
+    /// Deep clone the object to remove it from the GC
+    pub fn unwrap(&self) -> T {
+        (*self.0).clone()
+    }
+
+    pub fn make_mut(&mut self) -> &mut T {
+        Shared::make_mut(&mut self.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: Clone> Gc<T> {
     /// Deep clone the object to remove it from the GC
     pub fn unwrap(&self) -> T {
@@ -487,6 +629,65 @@ impl<T: Clone> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T> Gc<T> {
+    pub fn new(val: T) -> Gc<T> {
+        Gc(Shared::new(val))
+    }
+
+    pub fn new_mut(val: T) -> GcMut<T> {
+        Gc::new(RwLock::new(val))
+    }
+
+    pub fn new_lock(val: T) -> GcLock<T> {
+        Gc::new(parking_lot::Mutex::new(val))
+    }
+
+    pub fn try_new(val: T) -> Result<Gc<T>, SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
+        if mem > MAXIMUM_OBJECTS {
+            stop!(Generic => "ran out of memory!")
+        }
+        Ok(Gc(Shared::new(val)))
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T, A: Allocator + Clone + 'static> Gc<T, A> {
+    pub fn new_in(val: T, alloc: A) -> Self {
+        Gc(Shared::new_in(val, alloc))
+    }
+
+    pub fn new_mut_in(val: T, alloc: A) -> Gc<RwLock<T>, A> {
+        Gc::new_in(RwLock::new(val), alloc)
+    }
+
+    pub fn new_lock_in(val: T, alloc: A) -> Gc<parking_lot::Mutex<T>, A> {
+        Gc::new_in(parking_lot::Mutex::new(val), alloc)
+    }
+
+    pub fn checked_allocate(allocations: usize) -> Result<(), SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(0, Ordering::SeqCst);
+        if mem + allocations > MAXIMUM_OBJECTS {
+            stop!(Generic => "allocation would exceed maximum allowed memory")
+        }
+        Ok(())
+    }
+
+    pub fn try_unwrap(self) -> Result<T, Gc<T, A>> {
+        Shared::try_unwrap(self.0).map_err(|x| Gc(x))
+    }
+
+    pub fn check_memory() -> Result<usize, SteelErr> {
+        let mem: usize = OBJECT_COUNT.fetch_add(0, Ordering::SeqCst);
+        if mem > MAXIMUM_OBJECTS {
+            stop!(Generic => "ran out of memory!")
+        }
+        Ok(mem)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T> Gc<T> {
     pub fn new(val: T) -> Gc<T> {
         // OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -542,6 +743,36 @@ impl<T> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Gc<T, A> {
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        Shared::get_mut(&mut self.0)
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        Shared::ptr_eq(&this.0, &other.0)
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        Shared::as_ptr(&self.0)
+    }
+
+    pub fn into_raw(self) -> *const T {
+        Shared::into_raw(self.0)
+    }
+
+    /// The allocator travels with the heap block itself (§3.2), so this correctly
+    /// reconstructs a `Gc<T, A>` regardless of which allocator originally produced `this`.
+    pub unsafe fn from_raw(this: *const T) -> Self {
+        Self(unsafe { Shared::from_raw(this) })
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        Shared::strong_count(&this.0)
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Gc<T> {
     pub fn get_mut(&mut self) -> Option<&mut T> {
         Shared::get_mut(&mut self.0)
@@ -568,12 +799,29 @@ impl<T: ?Sized> Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T, A: Allocator + Clone + 'static> AsRef<T> for Gc<T, A> {
+    fn as_ref(&self) -> &T {
+        self.0.as_ref()
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T> AsRef<T> for Gc<T> {
     fn as_ref(&self) -> &T {
         self.0.as_ref()
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Deref for Gc<T, A> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.deref()
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Deref for Gc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -581,6 +829,15 @@ impl<T: ?Sized> Deref for Gc<T> {
     }
 }
 
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<T: ?Sized, A: Allocator + Clone + 'static> Clone for Gc<T, A> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Gc(Shared::clone(&self.0))
+    }
+}
+
+#[cfg(not(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe"))))]
 impl<T: ?Sized> Clone for Gc<T> {
     #[inline(always)]
     fn clone(&self) -> Self {
@@ -615,6 +872,158 @@ impl From<&String> for Gc<String> {
 impl AsRef<str> for Gc<String> {
     fn as_ref(&self) -> &str {
         self.0.as_ref()
+    }
+}
+
+// `std::String` has no allocator parameter on stable Rust, and no stable-Rust,
+// allocator-api2-based `String<A>` crate exists (see ALLOCATOR_SPEC.md §3.4). A `Gc<str, A>`
+// (reusing BiasedRc's unsized-DST support) was tried and rejected: it's a fat pointer (2
+// words), and swapping a single SteelVal variant's payload from thin to fat grows the whole
+// 33-variant enum past its 16-byte budget, not just that one variant. This wraps a `Sized`
+// buffer instead, so `Gc<AllocString<A>, A>` stays an 8-byte thin pointer like `Gc<String>`
+// does today.
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+pub struct AllocString<A: Allocator + Clone + 'static = Global> {
+    bytes: allocator_api2::vec::Vec<u8, A>,
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> AllocString<A> {
+    pub fn new_in(s: &str, alloc: A) -> Self {
+        let mut bytes = allocator_api2::vec::Vec::with_capacity_in(s.len(), alloc);
+        bytes.extend_from_slice(s.as_bytes());
+        Self { bytes }
+    }
+
+    pub fn from_string_in(s: String, alloc: A) -> Self {
+        Self::new_in(&s, alloc)
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Safety: `bytes` is only ever populated by `new_in`/`from_string_in`/`push`/
+        // `push_str` from already-valid `&str`/`char` data.
+        unsafe { core::str::from_utf8_unchecked(&self.bytes) }
+    }
+
+    pub fn push(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        self.bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        self.bytes.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn allocator(&self) -> A {
+        self.bytes.allocator().clone()
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> Clone for AllocString<A> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+        }
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> Deref for AllocString<A> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> AsRef<OsStr> for AllocString<A> {
+    fn as_ref(&self) -> &OsStr {
+        OsStr::new(self.as_str())
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> fmt::Display for AllocString<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> fmt::Debug for AllocString<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> PartialEq for AllocString<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+impl<A: Allocator + Clone + 'static> Eq for AllocString<A> {}
+
+#[cfg(all(feature = "sync", feature = "biased", feature = "allocator-api2", not(feature = "triomphe")))]
+#[cfg(test)]
+mod alloc_string_tests {
+    use super::*;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::Arc;
+    use allocator_api2::alloc::AllocError;
+
+    #[derive(Clone)]
+    struct CountingAllocator {
+        allocs: Arc<AtomicUsize>,
+    }
+
+    unsafe impl Allocator for CountingAllocator {
+        fn allocate(&self, layout: std::alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
+            self.allocs.fetch_add(1, Relaxed);
+            Global.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: std::alloc::Layout) {
+            unsafe { Global.deallocate(ptr, layout) }
+        }
+    }
+
+    #[test]
+    fn allocates_through_the_given_allocator() {
+        let alloc = CountingAllocator {
+            allocs: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let s = AllocString::new_in("hello world", alloc.clone());
+        assert_eq!(alloc.allocs.load(Relaxed), 1);
+        assert_eq!(s.as_str(), "hello world");
+        assert_eq!(&*s, "hello world");
+
+        let owned = AllocString::from_string_in("goodbye".to_string(), alloc.clone());
+        assert_eq!(alloc.allocs.load(Relaxed), 2);
+        assert_eq!(owned.as_str(), "goodbye");
+    }
+
+    #[test]
+    fn wrapped_in_gc_stays_thin() {
+        // The property this whole design is for: Gc<AllocString<A>, A> is Sized-wrapping,
+        // so it stays an 8-byte thin pointer -- unlike Gc<str, A>, which is a 16-byte fat
+        // pointer and would blow SteelVal's budget (see ALLOCATOR_SPEC.md §3.4).
+        assert_eq!(
+            core::mem::size_of::<Gc<AllocString<CountingAllocator>, CountingAllocator>>(),
+            core::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn empty_string_is_valid() {
+        let unicode = AllocString::new_in("héllo wörld 🎉", Global);
+        assert_eq!(unicode.as_str(), "héllo wörld 🎉");
     }
 }
 
