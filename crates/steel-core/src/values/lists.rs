@@ -143,8 +143,16 @@ mod list_drop_handler {
 
     pub struct ListDropHandler;
 
-    use crate::rvals::cycles::IterativeDropHandler;
+    use crate::rvals::cycles::{
+        drop_impls::DROP_BUFFER, is_allocator_global, push_concrete, IterativeDropHandler,
+    };
 
+    // Same reasoning as cycles.rs's `drop_impls` module (which this cfg-gate and the
+    // `allocator-api2` <-> `without-drop-protection` guard in lib.rs mirror): whenever
+    // this compiles, `allocator-api2` is off, so `is_allocator_global::<A>()` is always
+    // true in practice here, but the check still lets this impl stay honestly generic
+    // over `A` while reusing the real `DROP_BUFFER` thread-local, same as before this
+    // list type became generic.
     impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> DropHandler<im_lists::list::GenericList<crate::rvals::SteelValGeneric<A>, PointerType, 4, 2, Self>>
         for ListDropHandler
     {
@@ -155,41 +163,107 @@ mod list_drop_handler {
             }
 
             if obj.strong_count() == 1 {
-                // `DROP_BUFFER` is a `thread_local!`, which can't be generic over `A` --
-                // its buffer-reuse fast path is only available for the concrete `Global`
-                // case (see cycles.rs's Drop impls, which use it directly). This generic
-                // path always allocates a fresh queue instead.
-                let mut drop_buffer = VecDeque::new();
+                if is_allocator_global::<A>() {
+                    if DROP_BUFFER
+                        .try_with(|drop_buffer| {
+                            if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
+                                for value in core::mem::take(obj).draining_iterator() {
+                                    match &value {
+                                        SteelValGeneric::BoolV(_)
+                                        | SteelValGeneric::NumV(_)
+                                        | SteelValGeneric::IntV(_)
+                                        | SteelValGeneric::CharV(_)
+                                        | SteelValGeneric::Void
+                                        | SteelValGeneric::StringV(_)
+                                        | SteelValGeneric::FuncV(_)
+                                        | SteelValGeneric::SymbolV(_)
+                                        | SteelValGeneric::FutureFunc(_)
+                                        | SteelValGeneric::FutureV(_)
+                                        | SteelValGeneric::BoxedFunction(_)
+                                        | SteelValGeneric::MutFunc(_)
+                                        | SteelValGeneric::BuiltIn(_)
+                                        | SteelValGeneric::BigNum(_)
+                                        | SteelValGeneric::MutableVector(_) => continue,
+                                        SteelValGeneric::ListV(l) => {
+                                            if l.strong_count() == 1 {
+                                                push_concrete(&mut drop_buffer, value);
+                                            }
+                                        }
+                                        _ => {
+                                            push_concrete(&mut drop_buffer, value);
+                                        }
+                                    }
+                                }
 
-                for value in core::mem::take(obj).draining_iterator() {
-                    match &value {
-                        SteelValGeneric::BoolV(_)
-                        | SteelValGeneric::NumV(_)
-                        | SteelValGeneric::IntV(_)
-                        | SteelValGeneric::CharV(_)
-                        | SteelValGeneric::Void
-                        | SteelValGeneric::StringV(_)
-                        | SteelValGeneric::FuncV(_)
-                        | SteelValGeneric::SymbolV(_)
-                        | SteelValGeneric::FutureFunc(_)
-                        | SteelValGeneric::FutureV(_)
-                        | SteelValGeneric::BoxedFunction(_)
-                        | SteelValGeneric::MutFunc(_)
-                        | SteelValGeneric::BuiltIn(_)
-                        | SteelValGeneric::BigNum(_)
-                        | SteelValGeneric::MutableVector(_) => continue,
-                        SteelValGeneric::ListV(l) => {
-                            if l.strong_count() == 1 {
+                                IterativeDropHandler::bfs(&mut drop_buffer);
+                            }
+                        })
+                        .is_err()
+                    {
+                        let mut drop_buffer = VecDeque::new();
+                        for value in core::mem::take(obj).draining_iterator() {
+                            match &value {
+                                SteelValGeneric::BoolV(_)
+                                | SteelValGeneric::NumV(_)
+                                | SteelValGeneric::IntV(_)
+                                | SteelValGeneric::CharV(_)
+                                | SteelValGeneric::Void
+                                | SteelValGeneric::StringV(_)
+                                | SteelValGeneric::FuncV(_)
+                                | SteelValGeneric::SymbolV(_)
+                                | SteelValGeneric::FutureFunc(_)
+                                | SteelValGeneric::FutureV(_)
+                                | SteelValGeneric::BoxedFunction(_)
+                                | SteelValGeneric::MutFunc(_)
+                                | SteelValGeneric::BuiltIn(_)
+                                | SteelValGeneric::BigNum(_)
+                                | SteelValGeneric::MutableVector(_) => continue,
+                                SteelValGeneric::ListV(l) => {
+                                    if l.strong_count() == 1 {
+                                        drop_buffer.push_back(value);
+                                    }
+                                }
+                                _ => {
+                                    drop_buffer.push_back(value);
+                                }
+                            }
+                        }
+
+                        IterativeDropHandler::bfs(&mut drop_buffer);
+                    }
+                } else {
+                    let mut drop_buffer = VecDeque::new();
+
+                    for value in core::mem::take(obj).draining_iterator() {
+                        match &value {
+                            SteelValGeneric::BoolV(_)
+                            | SteelValGeneric::NumV(_)
+                            | SteelValGeneric::IntV(_)
+                            | SteelValGeneric::CharV(_)
+                            | SteelValGeneric::Void
+                            | SteelValGeneric::StringV(_)
+                            | SteelValGeneric::FuncV(_)
+                            | SteelValGeneric::SymbolV(_)
+                            | SteelValGeneric::FutureFunc(_)
+                            | SteelValGeneric::FutureV(_)
+                            | SteelValGeneric::BoxedFunction(_)
+                            | SteelValGeneric::MutFunc(_)
+                            | SteelValGeneric::BuiltIn(_)
+                            | SteelValGeneric::BigNum(_)
+                            | SteelValGeneric::MutableVector(_) => continue,
+                            SteelValGeneric::ListV(l) => {
+                                if l.strong_count() == 1 {
+                                    drop_buffer.push_back(value);
+                                }
+                            }
+                            _ => {
                                 drop_buffer.push_back(value);
                             }
                         }
-                        _ => {
-                            drop_buffer.push_back(value);
-                        }
                     }
-                }
 
-                IterativeDropHandler::bfs(&mut drop_buffer);
+                    IterativeDropHandler::bfs(&mut drop_buffer);
+                }
             }
         }
     }

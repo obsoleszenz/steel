@@ -9,11 +9,27 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
 
-fn is_allocator_global<A>() -> bool
-where 
-    A: crate::gc::Allocator + Clone + Send + Sync + 'static {
-   core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>()   
+pub(crate) fn is_allocator_global<A>() -> bool
+where
+    A: crate::gc::Allocator + Clone + Send + Sync + 'static,
+{
+    core::any::TypeId::of::<A>() == core::any::TypeId::of::<crate::gc::Global>()
+}
 
+/// Reinterprets a `SteelValGeneric<A>` already proven concrete (caller has checked
+/// `is_allocator_global::<A>()`) as `SteelVal`, and pushes it into a `DROP_BUFFER`/
+/// `FORMAT_BUFFER`-shaped concrete queue. Same justification as `push_concrete_into`.
+/// Only `drop_impls` and `ListDropHandler` call this (both `not(without-drop-protection)`).
+#[cfg(not(feature = "without-drop-protection"))]
+pub(crate) fn push_concrete<A>(queue: &mut VecDeque<SteelVal>, value: SteelValGeneric<A>)
+where
+    A: crate::gc::Allocator + Clone + Send + Sync + 'static,
+{
+    // Safety: caller already proved `A == Global` via `is_allocator_global::<A>()`, so
+    // `SteelValGeneric<A>` and `SteelVal` are identically the same type.
+    let value: SteelVal =
+        unsafe { core::mem::transmute_copy(&core::mem::ManuallyDrop::new(value)) };
+    queue.push_back(value);
 }
 
 /// Pushes a known-concrete `SteelVal` (e.g. from `UserDefinedStruct`'s fields,
@@ -773,10 +789,17 @@ pub(crate) mod drop_impls {
 
     use super::*;
 
-    // `thread_local!` statics can't be generic over `A` (Rust requires a concrete,
-    // monomorphic type), so this buffer-reuse optimization only applies to the `Global`
-    // case. Generic callers (any A) always allocate a fresh queue instead -- see
-    // `IterativeDropHandler::bfs`'s and `ListDropHandler::drop_handler`'s generic paths.
+    // This whole module only compiles under `not(feature = "without-drop-protection")`,
+    // and `lib.rs` requires `allocator-api2` to imply `without-drop-protection` -- so
+    // whenever this module exists, `allocator-api2` is off and nothing anywhere in the
+    // crate can construct a non-`Global` `A` in the first place. `DROP_BUFFER`/
+    // `FORMAT_BUFFER` are still declared as `RefCell<VecDeque<SteelVal>>` (a `thread_local!`
+    // has to be one fixed, concrete type), so each `Drop` impl below proves `A == Global`
+    // via `is_allocator_global::<A>()` before reaching for them -- a check that's always
+    // true in practice here, but is what lets these impls stay honestly generic over `A`
+    // (required by Rust: a `Drop` impl for a generic type must cover every `A`, see
+    // E0366) while their *body* is the same `DROP_BUFFER`-reusing logic this crate always
+    // had, rather than a fresh `VecDeque` on every drop.
     thread_local! {
         pub static DROP_BUFFER: RefCell<VecDeque<SteelVal>> = RefCell::new(VecDeque::with_capacity(128));
         pub static FORMAT_BUFFER: RefCell<VecDeque<SteelVal>> = RefCell::new(VecDeque::with_capacity(128));
@@ -789,13 +812,25 @@ pub(crate) mod drop_impls {
             }
 
             if let Some(inner) = self.0.get_mut() {
-                // `DROP_BUFFER` is a `thread_local!` and can't be generic over `A` --
-                // its buffer-reuse fast path only applies to the concrete `Global` case.
-                let mut drop_buffer = VecDeque::new();
-                for value in core::mem::take(inner) {
-                    drop_buffer.push_back(value);
+                if is_allocator_global::<A>() {
+                    DROP_BUFFER
+                        .try_with(|drop_buffer| {
+                            if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
+                                for value in core::mem::take(inner) {
+                                    push_concrete(&mut drop_buffer, value);
+                                }
+
+                                IterativeDropHandler::bfs(&mut drop_buffer);
+                            }
+                        })
+                        .ok();
+                } else {
+                    let mut drop_buffer = VecDeque::new();
+                    for value in core::mem::take(inner) {
+                        drop_buffer.push_back(value);
+                    }
+                    IterativeDropHandler::bfs(&mut drop_buffer);
                 }
-                IterativeDropHandler::bfs(&mut drop_buffer);
             }
         }
     }
@@ -807,28 +842,58 @@ pub(crate) mod drop_impls {
             }
 
             if let Some(inner) = self.0.get_mut() {
-                let mut drop_buffer = VecDeque::new();
-                for (key, value) in core::mem::take(inner) {
-                    drop_buffer.push_back(key);
-                    drop_buffer.push_back(value);
+                if is_allocator_global::<A>() {
+                    DROP_BUFFER
+                        .try_with(|drop_buffer| {
+                            if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
+                                for (key, value) in core::mem::take(inner) {
+                                    push_concrete(&mut drop_buffer, key);
+                                    push_concrete(&mut drop_buffer, value);
+                                }
+
+                                IterativeDropHandler::bfs(&mut drop_buffer);
+                            }
+                        })
+                        .ok();
+                } else {
+                    let mut drop_buffer = VecDeque::new();
+                    for (key, value) in core::mem::take(inner) {
+                        drop_buffer.push_back(key);
+                        drop_buffer.push_back(value);
+                    }
+                    IterativeDropHandler::bfs(&mut drop_buffer);
                 }
-                IterativeDropHandler::bfs(&mut drop_buffer);
             }
         }
     }
 
-    // `DROP_BUFFER`'s thread-local reuse optimization only applies to the concrete
-    // `Global` case (see the comment above it) -- generic `A` always allocates a fresh
-    // queue, same as `SteelVector<A>`/`SteelHashMap<A>` above.
     impl<A: crate::gc::Allocator + Clone + Send + Sync + 'static> Drop for UserDefinedStruct<A> {
         fn drop(&mut self) {
             if self.fields.is_empty() {
                 return;
             }
 
-            let mut drop_buffer = VecDeque::new();
-            drop_buffer.extend(self.fields.drain(..));
-            IterativeDropHandler::bfs(&mut drop_buffer);
+            if is_allocator_global::<A>() {
+                if DROP_BUFFER
+                    .try_with(|drop_buffer| {
+                        if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
+                            for value in self.fields.drain(..) {
+                                push_concrete(&mut drop_buffer, value);
+                            }
+
+                            IterativeDropHandler::bfs(&mut drop_buffer);
+                        }
+                    })
+                    .is_err()
+                {
+                    let mut buffer = self.fields.drain(..).collect();
+                    IterativeDropHandler::bfs(&mut buffer);
+                }
+            } else {
+                let mut drop_buffer = VecDeque::new();
+                drop_buffer.extend(self.fields.drain(..));
+                IterativeDropHandler::bfs(&mut drop_buffer);
+            }
         }
     }
 
@@ -838,10 +903,23 @@ pub(crate) mod drop_impls {
                 return;
             }
 
-            let mut drop_buffer = VecDeque::new();
-            drop_buffer.push_back(self.initial_value.make_void());
-            drop_buffer.push_back(self.stream_thunk.make_void());
-            IterativeDropHandler::bfs(&mut drop_buffer);
+            if is_allocator_global::<A>() {
+                DROP_BUFFER
+                    .try_with(|drop_buffer| {
+                        if let Ok(mut drop_buffer) = drop_buffer.try_borrow_mut() {
+                            push_concrete(&mut drop_buffer, self.initial_value.make_void());
+                            push_concrete(&mut drop_buffer, self.stream_thunk.make_void());
+
+                            IterativeDropHandler::bfs(&mut drop_buffer);
+                        }
+                    })
+                    .ok();
+            } else {
+                let mut drop_buffer = VecDeque::new();
+                drop_buffer.push_back(self.initial_value.make_void());
+                drop_buffer.push_back(self.stream_thunk.make_void());
+                IterativeDropHandler::bfs(&mut drop_buffer);
+            }
         }
     }
 

@@ -259,20 +259,36 @@ gets its own resolution for v1, not a single blanket treatment:
   it gets its own allocator-aware replacement). Given the realtime use case is a single
   dedicated thread, this combination is unlikely to be needed soon, but it's a real,
   named gap rather than a silent one.
+- The **stack-safe iterative drop machinery** (`DROP_BUFFER`/`FORMAT_BUFFER` and the
+  custom `Drop` impls for `SteelVector`/`SteelHashMap`/`UserDefinedStruct`/`LazyStream` in
+  `rvals/cycles.rs`, plus `List`'s `ListDropHandler`) — this exists to avoid a deep,
+  stack-recursive drop overflowing the Rust stack, and its fast path is a `thread_local!`,
+  which Rust requires to be one fixed, concrete, monomorphic type. That can only ever be
+  proven sound for the concrete `Global` allocator (via a `TypeId` check at each
+  `Drop::drop`/`drop_handler`), never for an arbitrary caller-supplied one. Rather than
+  leave a second, un-cached fallback path for real custom allocators that both loses the
+  stack-safety guarantee it exists for *and* quietly allocates through `Global` regardless
+  of the caller's own allocator (on the realtime hot path this whole effort is for),
+  `allocator-api2` **requires `without-drop-protection`** (`compile_error!` in `lib.rs`):
+  with it on, this whole machinery is compiled out and ordinary, fully allocator-generic
+  structural `Drop` is used instead, for free. `without-drop-protection` off (the default)
+  is completely unaffected either way — the `Global` fast path stays exactly as it always
+  was.
 
-None of these three is a silent, quiet exception in the end — every one of them either
+None of these four is a silent, quiet exception in the end — every one of them either
 holds the invariant exactly or fails loudly instead of hiding a violation:
-`shared_vector`+`sync`+`allocator-api2` is a hard, named incompatibility
-(`compile_error!`, decided at build time). `BigNum`/`BigRational` and `SmallVec`'s spill
-path are both the same shape — disabled/erroring outright rather than falling back to
-`Global` — just at different times: bignum promotion is a build-time-known limitation
-(no bignum arithmetic under `allocator-api2` at all, until fixed later), while
-`smallvec`'s spill is a runtime check (the common, inline case is completely unaffected;
-only exceeding the inline count under `allocator-api2` errors). None of the three sit on
-the call path you're optimizing (`call_function_by_name_with_args_from_mut_slice` on an
-already-compiled closure with no bignums/rationals involved, and argument/struct counts
-that fit inline), so shipping with these three documented v1 boundaries is defensible,
-not scope creep hiding as a "special internal allocator."
+`shared_vector`+`sync`+`allocator-api2` and `allocator-api2`+drop-protection are both
+hard, named incompatibilities (`compile_error!`, decided at build time). `BigNum`/
+`BigRational` and `SmallVec`'s spill path are both the same shape — disabled/erroring
+outright rather than falling back to `Global` — just at different times: bignum promotion
+is a build-time-known limitation (no bignum arithmetic under `allocator-api2` at all,
+until fixed later), while `smallvec`'s spill is a runtime check (the common, inline case
+is completely unaffected; only exceeding the inline count under `allocator-api2` errors).
+None of the four sit on the call path you're optimizing
+(`call_function_by_name_with_args_from_mut_slice` on an already-compiled closure with no
+bignums/rationals involved, argument/struct counts that fit inline, and drop protection
+already off), so shipping with these four documented v1 boundaries is defensible, not
+scope creep hiding as a "special internal allocator."
 
 ### 3.7 dylibs
 

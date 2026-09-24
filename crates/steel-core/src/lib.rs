@@ -7,6 +7,16 @@ compile_error!(
      ALLOCATOR_SPEC.md)"
 );
 
+#[cfg(all(feature = "allocator-api2", not(feature = "without-drop-protection")))]
+compile_error!(
+    "allocator-api2 requires without-drop-protection: the stack-safe iterative drop \
+     machinery (DROP_BUFFER and friends in rvals::cycles) is a `thread_local!`, which Rust \
+     requires to be one fixed, concrete, monomorphic type -- so it can only ever be proven \
+     sound for the concrete `Global` allocator, never for an arbitrary caller-supplied one. \
+     `without-drop-protection` switches to plain structural Drop instead, which needs no \
+     such proof and is allocator-generic for free (see ALLOCATOR_SPEC.md)."
+);
+
 extern crate alloc;
 extern crate im_rc;
 #[macro_use]

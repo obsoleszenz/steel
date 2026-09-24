@@ -5,10 +5,11 @@
 //! Run with:
 //!
 //!   cargo run -p steel-core --example custom_allocator --no-default-features \
-//!       --features std,modules,sync,biased,allocator-api2
+//!       --features std,modules,sync,biased,allocator-api2,without-drop-protection
 //!
-//! (`jit2` and `allocator-api2` can't be enabled together -- see the `compile_error!` in
-//! `lib.rs` -- so this example is only meaningful with `jit2` left off.)
+//! (`jit2` and `allocator-api2` can't be enabled together, and `allocator-api2` requires
+//! `without-drop-protection` -- see the `compile_error!`s in `lib.rs` and ALLOCATOR_SPEC.md
+//! §3.6 -- so this example is only meaningful with `jit2` left off and drop protection off.)
 
 extern crate steel;
 
